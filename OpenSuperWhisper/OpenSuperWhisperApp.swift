@@ -22,7 +22,7 @@ struct OpenSuperWhisperApp: App {
         WindowGroup {
             Group {
                 if Self.isRunningTests {
-                    EmptyView()
+                    TestHostWindowHider()
                 } else if !appState.hasCompletedOnboarding {
                     OnboardingView()
                 } else {
@@ -57,6 +57,25 @@ struct OpenSuperWhisperApp: App {
         _ = MicrophoneService.shared
         WhisperModelManager.shared.ensureDefaultModelPresent()
     }
+}
+
+/// Stands in for the main window's content when the app hosts unit tests,
+/// and takes the empty window off the screen as soon as it is attached.
+/// The test host shares the app's defaults domain, so the window must not
+/// autosave its frame there either.
+struct TestHostWindowHider: NSViewRepresentable {
+    final class HidingView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            window.setFrameAutosaveName("")
+            window.isRestorable = false
+            DispatchQueue.main.async { window.orderOut(nil) }
+        }
+    }
+
+    func makeNSView(context: Context) -> NSView { HidingView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 extension OpenSuperWhisperApp {
@@ -105,6 +124,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, ObservableOb
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Unit tests run inside the app, one copy per parallel test process:
+        // keep those copies out of the Dock and from taking focus.
+        if OpenSuperWhisperApp.isRunningTests {
+            NSApplication.shared.setActivationPolicy(.accessory)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
