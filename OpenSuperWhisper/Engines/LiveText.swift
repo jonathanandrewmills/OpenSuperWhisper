@@ -16,9 +16,12 @@ struct LiveWord: Equatable {
 /// Text handling for live transcription.
 enum LiveText {
     /// Joins chunk texts the way WhisperEngine.assembleSegmentTexts joins
-    /// segments: Whisper's text already carries its own leading space. A chunk
-    /// that starts without one would glue two words together, so a space is
-    /// added there, except next to Chinese or Japanese, which use no spaces.
+    /// segments: each text exactly as decoded, in order, since Whisper's text
+    /// already carries its own leading space. A chunk that starts without one
+    /// would glue two words together, so a space is added there, except next
+    /// to Chinese or Japanese, which use no spaces. Nothing else is changed:
+    /// a phrase Whisper repeats at a chunk's start stays, as the batch decode
+    /// of that chunk has it.
     static func join(_ parts: [String]) -> String {
         var result = ""
         for part in parts where !part.isEmpty {
@@ -29,58 +32,6 @@ enum LiveText {
             result.append(part)
         }
         return result
-    }
-
-    /// Joins decoded chunks into the dictation's text: each chunk's batch
-    /// decode, in order, as decoded. The one exception is a chunk that
-    /// follows a forced cut, which can split a sentence (see
-    /// droppingRepeatedLead). After a pause, a chunk starts a new phrase,
-    /// and repeating words is ordinary speech ("I think we should, I think
-    /// we should go"; "see you on the call. On the call we will review"),
-    /// so it is kept as the batch decode keeps it. The first text is never
-    /// trimmed, so a dictation with no cut reads exactly like today's.
-    static func joinChunks(_ chunks: [(text: String, followsForcedCut: Bool)]) -> String {
-        var result = ""
-        for chunk in chunks where !chunk.text.isEmpty {
-            let text = !result.isEmpty && chunk.followsForcedCut
-                ? droppingRepeatedLead(of: chunk.text, after: result)
-                : chunk.text
-            result = join([result, text])
-        }
-        return result
-    }
-
-    /// Whisper, prompted with the text so far, sometimes opens a chunk that
-    /// starts mid-sentence by repeating a phrase: its own first three or more
-    /// words, or two or more of the last words before the cut. Chunks never
-    /// share audio, so such a repeat is dropped. Short repeats are kept,
-    /// since speech has those ("that that", "two words, two words", "谢谢").
-    static func droppingRepeatedLead(of text: String, after previous: String) -> String {
-        let words = words(in: text)
-        let earlier = Array(Self.words(in: previous).suffix(8))
-        func isPhrase(_ phrase: ArraySlice<LiveWord>) -> Bool {
-            phrase.count >= 2 && phrase.reduce(0) { $0 + $1.key.count } >= 4
-        }
-        func same(_ lhs: ArraySlice<LiveWord>, _ rhs: ArraySlice<LiveWord>) -> Bool {
-            lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { $0.key == $1.key }
-        }
-        var repeated = 0
-        for length in stride(from: min(8, words.count / 2), through: 3, by: -1)
-        where isPhrase(words[0..<length]) && same(words[0..<length], words[length..<2 * length]) {
-            repeated = length
-            break
-        }
-        if repeated == 0 {
-            for length in stride(from: min(8, words.count, earlier.count), through: 2, by: -1)
-            where isPhrase(words[0..<length]) && same(words[0..<length], earlier.suffix(length)[...]) {
-                repeated = length
-                break
-            }
-        }
-        guard repeated > 0, repeated < words.count else { return text }
-        let leading = words[0].text.prefix(while: \.isWhitespace)
-        let kept = words[repeated...]
-        return String(leading) + String(kept.first!.text.drop(while: \.isWhitespace)) + kept.dropFirst().map(\.text).joined()
     }
 
     static func words(in text: String) -> [LiveWord] {
