@@ -136,6 +136,26 @@ final class LiveTranscriptionModelTests: XCTestCase {
         }
     }
 
+    func testAnAbortSentAsAPreviewStartsIsNotLost() async throws {
+        let engine = try await loadEngine(try tinyEnglishModel())
+        let decoder = try engine.makeLiveDecoder(settings: settings(language: "en", beamSearch: false))
+        defer { decoder.close() }
+        let clip = Array(try samples(of: "long_en").prefix(6 * Self.sampleRate))
+
+        // Release aborts a preview the session has just started.
+        decoder.abortCurrentPass()
+        XCTAssertThrowsError(try decoder.decodePreview(clip, history: [], language: nil)) { error in
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        decoder.abortCurrentPass()
+        XCTAssertFalse(try decoder.decodeChunk(clip, history: [], language: nil).text.isEmpty,
+                       "A chunk pass is never stopped by an abort meant for a preview")
+        decoder.abortCurrentPass()
+        decoder.resetAbort()
+        XCTAssertFalse(try decoder.decodePreview(clip, history: [], language: nil).isEmpty,
+                       "The session clears a stale abort before the next preview")
+    }
+
     @MainActor
     func testServiceTakesTheTextOfTheLiveSessionForItsRecording() async throws {
         let engine = try await loadEngine(try tinyEnglishModel())

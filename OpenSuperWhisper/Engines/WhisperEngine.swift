@@ -777,7 +777,7 @@ final class WhisperLiveDecoder: LiveDecoding {
         language: String?,
         preview: Bool
     ) throws -> WhisperEngine.DecodedPass? {
-        let (state, vad) = try beginPass()
+        let (state, vad) = try beginPass(clearingAbort: !preview)
         // Without earlier text the chunk is decoded exactly as the batch path
         // decodes a recording, so a dictation with no cut gets today's text.
         let prompt = history.isEmpty ? nil : LivePrompt.tokens(
@@ -819,13 +819,26 @@ final class WhisperLiveDecoder: LiveDecoding {
         )
     }
 
-    private func beginPass() throws -> (MyWhisperState, MyWhisperVadContext) {
+    /// A chunk pass clears an abort left over from a preview. A preview
+    /// keeps a pending abort: the session clears it before others may abort
+    /// the preview, so an abort sent as the preview starts is not lost.
+    private func beginPass(clearingAbort: Bool) throws -> (MyWhisperState, MyWhisperVadContext) {
         lock.lock()
         defer { lock.unlock() }
         guard !isCancelled else { throw CancellationError() }
         guard let state, let vad else { throw TranscriptionError.contextInitializationFailed }
-        abortFlag.isSet = false
+        if clearingAbort {
+            abortFlag.isSet = false
+        }
         return (state, vad)
+    }
+
+    func resetAbort() {
+        lock.lock()
+        if !isCancelled {
+            abortFlag.isSet = false
+        }
+        lock.unlock()
     }
 
     func cancel() {

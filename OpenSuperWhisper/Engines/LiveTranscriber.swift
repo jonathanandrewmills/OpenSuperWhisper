@@ -263,10 +263,13 @@ struct LiveChunkResult {
 protocol LiveDecoding: AnyObject {
     func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult
     /// A quick pass over the open chunk, for display only: greedy, at
-    /// temperature 0 and without fallback.
+    /// temperature 0 and without fallback. An abort sent before it starts
+    /// stops it; callers clear stale aborts with resetAbort() first.
     func decodePreview(_ samples: [Float], history: [WhisperToken], language: String?) throws -> String
     /// Aborts the running pass only. Safe from any thread.
     func abortCurrentPass()
+    /// Clears an abort meant for an earlier pass; a cancel stays.
+    func resetAbort()
     /// Aborts the running pass and every later one. Safe from any thread.
     func cancel()
     /// Frees native resources; called once no pass can run any more.
@@ -604,6 +607,9 @@ final class LiveTranscriber: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !finishRequested, !cancelled else { return nil }
+        // Cleared before the preview can be aborted, so an abort that
+        // arrives as the pass starts reaches it.
+        activeDecoder?.resetAbort()
         previewCount += 1
         runningPreview = previewCount
         return previewCount

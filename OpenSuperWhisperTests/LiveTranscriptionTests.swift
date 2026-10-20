@@ -245,6 +245,8 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
     private var previewCallsStorage = 0
     private var abortCountStorage = 0
     private var previewAbort: DispatchSemaphore?
+    /// Like whisper's abort flag: set by an abort, cleared only by resetAbort().
+    private var abortRequested = false
 
     var previewCalls: Int { lock.withLock { previewCallsStorage } }
     var abortCount: Int { lock.withLock { abortCountStorage } }
@@ -308,12 +310,14 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
         let index = previewCallsStorage
         previewCallsStorage += 1
         let text = previewTexts[min(index, previewTexts.count - 1)]
-        let abort = holdsPreviews ? DispatchSemaphore(value: 0) : nil
+        let aborted = abortRequested
+        let abort = holdsPreviews && !aborted ? DispatchSemaphore(value: 0) : nil
         previewAbort = abort
         let onStart = onPreviewStart
         lock.unlock()
 
         onStart?(index)
+        if aborted { throw CancellationError() }
         if let abort {
             abort.wait()
             throw CancellationError()
@@ -325,10 +329,15 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
     func abortCurrentPass() {
         lock.lock()
         abortCountStorage += 1
+        abortRequested = true
         let abort = previewAbort
         previewAbort = nil
         lock.unlock()
         abort?.signal()
+    }
+
+    func resetAbort() {
+        lock.withLock { abortRequested = false }
     }
 
     func cancel() {
