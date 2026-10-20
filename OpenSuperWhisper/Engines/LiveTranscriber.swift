@@ -151,11 +151,19 @@ struct ChunkCutter {
         silenceThreshold = parameters.silenceThreshold
     }
 
+    /// Where a chunk ends.
+    struct Cut: Equatable {
+        let frame: Int
+        /// Forced at the maximum length, so it can fall inside a sentence;
+        /// a pause cut never does.
+        let isForced: Bool
+    }
+
     var frameCount: Int { chunkStart + probabilities.count }
 
-    /// Adds the next frame and returns the frame the open chunk ends at, if
+    /// Adds the next frame and returns the cut that ends the open chunk, if
     /// this frame completes a chunk.
-    mutating func append(_ probability: Float) -> Int? {
+    mutating func append(_ probability: Float) -> Cut? {
         let frame = frameCount
         probabilities.append(probability)
         if probability >= speechThreshold {
@@ -170,11 +178,11 @@ struct ChunkCutter {
             let length = frame + 1 - start
             let middle = start + length / 2
             if length >= pauseFrames && middle - chunkStart >= minimumFrames {
-                return cut(at: middle)
+                return Cut(frame: cut(at: middle), isForced: false)
             }
         }
         if probabilities.count >= maximumFrames {
-            return cut(at: quietestFrame())
+            return Cut(frame: cut(at: quietestFrame()), isForced: true)
         }
         return nil
     }
@@ -273,12 +281,14 @@ struct LiveTranscript {
     struct Chunk: Equatable {
         let samples: Range<Int>
         let text: String
+        /// Starts at a forced cut, which can split a sentence.
+        var followsForcedCut = false
     }
 
     let chunks: [Chunk]
 
     /// Raw joined text; the caller runs the usual cleanup once over it.
-    var text: String { LiveText.join(chunks.map(\.text)) }
+    var text: String { LiveText.joinChunks(chunks.map { ($0.text, $0.followsForcedCut) }) }
 }
 
 /// What the indicator shows while recording: text that will not change
@@ -327,7 +337,8 @@ final class LiveTranscriber: @unchecked Sendable {
     private var cutter: ChunkCutter
     private var probedSamples = 0
     private var openChunkStart = 0
-    private var cutChunks: [Range<Int>] = []
+    private var openChunkFollowsForcedCut = false
+    private var cutChunks: [(range: Range<Int>, followsForcedCut: Bool)] = []
     private var chunks: [LiveTranscript.Chunk] = []
     private var history: [WhisperToken] = []
     private var language: String?
@@ -491,18 +502,19 @@ final class LiveTranscriber: @unchecked Sendable {
             throw LiveTranscriptionError.probeFailed
         }
         probedSamples = range.upperBound
-        var cut = false
+        var didCut = false
         for probability in probabilities {
             heardSpeechSincePreview = heardSpeechSincePreview || probability >= parameters.speechThreshold
-            if let cutFrame = cutter.append(probability) {
-                let cutSample = cutFrame * frameSampleCount
-                cutChunks.append(openChunkStart..<cutSample)
+            if let cut = cutter.append(probability) {
+                let cutSample = cut.frame * frameSampleCount
+                cutChunks.append((openChunkStart..<cutSample, openChunkFollowsForcedCut))
                 openChunkStart = cutSample
+                openChunkFollowsForcedCut = cut.isForced
                 // The chunk keeps its settled words on screen until its own
                 // pass replaces them; what was still changing goes.
                 pendingPreviewTexts.append(agreement.settledText)
                 agreement = LiveAgreement()
-                cut = true
+                didCut = true
             }
         }
         // More than one chunk waiting means passes are slower than speech:
@@ -511,12 +523,13 @@ final class LiveTranscriber: @unchecked Sendable {
             previewsStopped = true
             print("[live] preview stopped for this recording: \(cutChunks.count) chunks waiting")
         }
-        if cut { publishPreview() }
+        if didCut { publishPreview() }
     }
 
     private func decodeCutChunks() throws {
         while !cutChunks.isEmpty {
-            try decode(cutChunks.removeFirst())
+            let chunk = cutChunks.removeFirst()
+            try decode(chunk.range, followsForcedCut: chunk.followsForcedCut)
             // Its own text now replaces its preview words.
             if !pendingPreviewTexts.isEmpty { pendingPreviewTexts.removeFirst() }
             publishPreview()
@@ -592,7 +605,7 @@ final class LiveTranscriber: @unchecked Sendable {
 
     private func publishPreview() {
         guard let onPreview else { return }
-        let settled = LiveText.join(chunks.map(\.text) + pendingPreviewTexts + [agreement.settledText])
+        let settled = LiveText.join([LiveTranscript(chunks: chunks).text] + pendingPreviewTexts + [agreement.settledText])
         let joined = LiveText.join([settled, agreement.unsettledText])
         let preview = LivePreview(settled: settled, unsettled: String(joined.dropFirst(settled.count)))
         guard preview != lastPreview else { return }
@@ -600,12 +613,12 @@ final class LiveTranscriber: @unchecked Sendable {
         onPreview(preview)
     }
 
-    private func decode(_ range: Range<Int>) throws {
+    private func decode(_ range: Range<Int>, followsForcedCut: Bool) throws {
         guard !isCancelled else { throw CancellationError() }
         guard let decoder else { throw TranscriptionError.contextInitializationFailed }
         let started = Date()
         let result = try decoder.decodeChunk(audio.samples(in: range), history: history, language: language)
-        chunks.append(LiveTranscript.Chunk(samples: range, text: result.text))
+        chunks.append(LiveTranscript.Chunk(samples: range, text: result.text, followsForcedCut: followsForcedCut))
         history = Array((history + result.tokens).suffix(parameters.historyTokenLimit))
         if language == nil {
             language = result.detectedLanguage
@@ -630,7 +643,7 @@ final class LiveTranscriber: @unchecked Sendable {
             // After the stop tail, the open chunk is the last chunk.
             let end = audio.count
             if end > openChunkStart {
-                try decode(openChunkStart..<end)
+                try decode(openChunkStart..<end, followsForcedCut: openChunkFollowsForcedCut)
             }
         } catch {
             if isCancelled { throw CancellationError() }

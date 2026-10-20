@@ -8,7 +8,7 @@ final class ChunkCutterTests: XCTestCase {
 
     /// Feeds frames and returns every cut, as frame indices.
     private func cuts(_ frames: [Float], cutter: inout ChunkCutter) -> [Int] {
-        frames.compactMap { cutter.append($0) }
+        frames.compactMap { cutter.append($0)?.frame }
     }
 
     private func frames(_ value: Float, _ count: Int) -> [Float] {
@@ -63,6 +63,13 @@ final class ChunkCutterTests: XCTestCase {
         for index in 700..<703 { timeline[index] = 0.1 }
         XCTAssertEqual(cuts(timeline, cutter: &cutter), [701])
         XCTAssertEqual(cutter.chunkStart, 701)
+    }
+
+    func testCutsSayWhetherTheyWereForced() {
+        var cutter = ChunkCutter()
+        let timeline = frames(speech, 281) + frames(silence, 31) + frames(speech, 760)
+        XCTAssertEqual(timeline.compactMap { cutter.append($0) },
+                       [ChunkCutter.Cut(frame: 290, isForced: false), ChunkCutter.Cut(frame: 290 + 748, isForced: true)])
     }
 
     func testForcedCutWithoutAQuietStretchKeepsTheChunkLong() {
@@ -139,26 +146,46 @@ final class LiveTextJoinTests: XCTestCase {
 
     func testAChunkRepeatingItsOwnOpeningPhraseKeepsOneCopy() {
         // Turbo, prompted with the text so far, decoded the chunk that began
-        // mid-sentence in the long English fixture this way.
+        // at a forced cut in the long English fixture this way.
         XCTAssertEqual(
-            LiveText.join([" If this phrase is present,", " the last part of the last part of the audio was not clipped."]),
+            LiveText.joinChunks([
+                (" If this phrase is present,", false),
+                (" the last part of the last part of the audio was not clipped.", true),
+            ]),
             " If this phrase is present, the last part of the audio was not clipped."
         )
     }
 
-    func testAChunkRepeatingTheEndOfThePreviousOneDropsTheRepeat() {
+    func testTheFirstChunkIsKeptExactlyAsDecoded() {
+        // A dictation with no cut must read exactly like the batch path's.
+        XCTAssertEqual(LiveText.joinChunks([(" I want to I want to go home", false)]), " I want to I want to go home")
+        XCTAssertEqual(LiveText.joinChunks([("", false), (" I want to I want to go home", false)]), " I want to I want to go home",
+                       "The first chunk with text counts as the first")
+        XCTAssertEqual(LiveTranscript(chunks: [LiveTranscript.Chunk(samples: 0..<16_000, text: " I want to I want to go home")]).text,
+                       " I want to I want to go home")
+    }
+
+    func testAPauseCutKeepsWordsThatRepeatTheChunkBefore() {
         XCTAssertEqual(
-            LiveText.join([" The final checkpoint phrase is", " checkpoint phrase is silver compass."]),
+            LiveText.joinChunks([(" See you on the call.", false), (" On the call we will review the numbers.", false)]),
+            " See you on the call. On the call we will review the numbers."
+        )
+    }
+
+    func testAForcedCutDropsWordsThatRepeatTheChunkBefore() {
+        XCTAssertEqual(
+            LiveText.joinChunks([(" The final checkpoint phrase is", false), (" checkpoint phrase is silver compass.", true)]),
             " The final checkpoint phrase is silver compass."
         )
-        XCTAssertEqual(LiveText.join([" Remember the Alamo,", " Remember the Alamo!"]), " Remember the Alamo, Remember the Alamo!",
+        XCTAssertEqual(LiveText.joinChunks([(" Remember the Alamo,", false), (" Remember the Alamo!", true)]),
+                       " Remember the Alamo, Remember the Alamo!",
                        "A chunk that is nothing but the repeat is kept whole")
     }
 
-    func testShortRepeatsAndRepeatsAwayFromTheJoinAreKept() {
-        XCTAssertEqual(LiveText.join([" I said that", " that is fine."]), " I said that that is fine.")
-        XCTAssertEqual(LiveText.join(["谢谢", "谢谢你"]), "谢谢谢谢你")
-        XCTAssertEqual(LiveText.join([" One.", " Two words, two words again."]), " One. Two words, two words again.")
+    func testShortRepeatsAreKeptEvenAtAForcedCut() {
+        XCTAssertEqual(LiveText.joinChunks([(" I said that", false), (" that is fine.", true)]), " I said that that is fine.")
+        XCTAssertEqual(LiveText.joinChunks([("谢谢", false), ("谢谢你", true)]), "谢谢谢谢你")
+        XCTAssertEqual(LiveText.joinChunks([(" One.", false), (" Two words, two words again.", true)]), " One. Two words, two words again.")
     }
 }
 
@@ -518,6 +545,17 @@ final class LiveTranscriberTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? LiveTranscriptionError, .audioNotFinished)
         }
+    }
+
+    func testChunksRecordWhetherTheyStartAtAForcedCut() async throws {
+        let decoder = FakeLiveDecoder()
+        let (transcriber, buffer) = makeTranscriber(decoder)
+        // Continuous speech is cut at 24 s; the pause 10 s later cuts again.
+        feed(audio([(34, true), (1, false), (5, true)]), to: buffer)
+        buffer.finish()
+        let transcript = try await transcriber.finish()
+
+        XCTAssertEqual(transcript.chunks.map(\.followsForcedCut), [false, true, false])
     }
 
     func testSilentChunksAddNoText() async throws {

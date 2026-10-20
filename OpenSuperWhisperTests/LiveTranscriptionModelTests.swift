@@ -102,8 +102,8 @@ final class LiveTranscriptionModelTests: XCTestCase {
     private func repeatedTrigramsAtJoins(_ transcript: LiveTranscript) -> [String] {
         var repeated: [String] = []
         var joined = ""
-        for (index, chunk) in transcript.chunks.enumerated() {
-            let next = LiveText.join([joined, chunk.text])
+        for index in transcript.chunks.indices {
+            let next = LiveTranscript(chunks: Array(transcript.chunks.prefix(index + 1))).text
             if index > 0 {
                 let window = Array(words(joined).suffix(8) + words(String(next.dropFirst(joined.count))).prefix(8))
                 var seen = Set<String>()
