@@ -18,7 +18,7 @@ flowchart LR
     Probe --> Cutter{"ChunkCutter<br/>600 ms pause after 8 s,<br/>or quietest 100 ms by 24 s"}
     Cutter -->|"finished chunk"| ChunkPass["Chunk pass<br/>user's settings,<br/>earlier text as prompt"]
     Buffer -->|"open chunk,<br/>about once a second"| PreviewPass["Preview pass<br/>greedy, temperature 0"]
-    PreviewPass --> Agreement["Repetition guard and<br/>LocalAgreement-2"]
+    PreviewPass --> Agreement["LocalAgreement-2"]
   end
 
   subgraph Engine["WhisperEngine: one loaded model"]
@@ -31,7 +31,7 @@ flowchart LR
 
   Release["Hotkey release<br/>after a 250 ms tail"] --> Service["TranscriptionService<br/>transcribeAudio"]
   Wav --> Service
-  Service -->|"live session"| LastChunk["Last chunk pass,<br/>join, cleanup"]
+  Service -->|"live session"| LastChunk["Last chunk pass<br/>from saved samples,<br/>join, cleanup"]
   Service -->|"no session, or a pass failed"| Whole["Whole-recording pass"]
   LastChunk -.-> LiveState
   Whole -.-> BatchState
@@ -50,4 +50,4 @@ With Live Transcription off, which is the default, there is no live session: the
 
 Live mode also stands down for one recording, which then takes the whole-recording path, when Show Timestamps is on, when the engine is Parakeet, or when the transcription service is busy as recording starts.
 If any pass fails, the session frees its state and the recording is decoded whole at release.
-Esc, quitting, an engine reload and a recording sent to the queue cancel the session.
+Esc, quitting, an engine reload, a recording sent to the queue and a recording too short to transcribe cancel the session.
