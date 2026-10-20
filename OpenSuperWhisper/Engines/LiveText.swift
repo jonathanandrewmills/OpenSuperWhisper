@@ -89,63 +89,6 @@ enum LiveText {
     }
 }
 
-extension LiveText {
-    /// Keeps a preview pass up to the first copy of a phrase of up to eight
-    /// words that repeats three or more times in a row: Whisper's repetition
-    /// loops would otherwise fill the indicator.
-    static func cutRepetitionLoop(_ words: [LiveWord]) -> [LiveWord] {
-        let keys = words.map(\.key)
-        guard let (start, length) = firstLoop(in: keys, minimumCopies: 3) else { return words }
-        return Array(words.prefix(start + length))
-    }
-
-    /// Keeps at most two copies of any looping phrase, so one looping chunk
-    /// cannot prompt the next pass into the same loop.
-    static func capRepetitions<T: Equatable>(_ items: [T], maximumCopies: Int = 2) -> [T] {
-        var result: [T] = []
-        var index = 0
-        while index < items.count {
-            var collapsed = false
-            for length in 1...8 where index + length <= items.count {
-                let copies = copiesInARow(of: index..<index + length, in: items)
-                if copies > maximumCopies {
-                    for _ in 0..<maximumCopies { result.append(contentsOf: items[index..<index + length]) }
-                    index += copies * length
-                    collapsed = true
-                    break
-                }
-            }
-            if !collapsed {
-                result.append(items[index])
-                index += 1
-            }
-        }
-        return result
-    }
-
-    private static func firstLoop<T: Equatable>(in items: [T], minimumCopies: Int) -> (Int, Int)? {
-        for start in items.indices {
-            for length in 1...8 where start + length * minimumCopies <= items.count {
-                if copiesInARow(of: start..<start + length, in: items) >= minimumCopies {
-                    return (start, length)
-                }
-            }
-        }
-        return nil
-    }
-
-    private static func copiesInARow<T: Equatable>(of phrase: Range<Int>, in items: [T]) -> Int {
-        var copies = 1
-        var next = phrase.upperBound
-        while next + phrase.count <= items.count,
-              items[next..<next + phrase.count].elementsEqual(items[phrase]) {
-            copies += 1
-            next += phrase.count
-        }
-        return copies
-    }
-}
-
 /// LocalAgreement-2 over preview passes of the open chunk: a word is settled
 /// once two passes in a row agree on it and on everything before it. Settled
 /// words never change within the chunk, so the indicator does not flicker.

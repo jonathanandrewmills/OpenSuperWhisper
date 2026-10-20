@@ -584,7 +584,7 @@ final class LiveTranscriber: @unchecked Sendable {
         do {
             text = try decoder.decodePreview(
                 audio.samples(in: range),
-                history: LiveText.capRepetitions(history),
+                history: history,
                 language: language
             )
         } catch {
@@ -596,7 +596,7 @@ final class LiveTranscriber: @unchecked Sendable {
         }
         lastPreviewDuration = now() - start
         previewDurations.append(lastPreviewDuration)
-        agreement.update(with: LiveText.cutRepetitionLoop(LiveText.words(in: text)))
+        agreement.update(with: LiveText.words(in: text))
         publishPreview()
     }
 

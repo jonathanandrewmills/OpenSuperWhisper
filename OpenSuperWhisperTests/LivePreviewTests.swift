@@ -47,38 +47,6 @@ final class LiveAgreementTests: XCTestCase {
     }
 }
 
-final class LiveRepetitionGuardTests: XCTestCase {
-    private func cut(_ text: String) -> String {
-        LiveText.cutRepetitionLoop(LiveText.words(in: text)).map(\.text).joined()
-    }
-
-    func testOneWordLoopIsCutAfterTheFirstCopy() {
-        XCTAssertEqual(cut(" so no no no no no"), " so no")
-    }
-
-    func testPhraseLoopIsCutAfterTheFirstCopy() {
-        XCTAssertEqual(cut(" I said thank you thank you thank you thank you"), " I said thank you")
-    }
-
-    func testTwoCopiesAreKept() {
-        XCTAssertEqual(cut(" thank you thank you and goodbye"), " thank you thank you and goodbye")
-    }
-
-    func testTheEarliestLoopIsCut() {
-        XCTAssertEqual(cut(" a a a b c b c b c"), " a")
-    }
-
-    func testLoopsMatchWithoutCaseOrPunctuation() {
-        XCTAssertEqual(cut(" Yes. yes, YES yes"), " Yes.")
-    }
-
-    func testPromptsKeepAtMostTwoCopies() {
-        XCTAssertEqual(LiveText.capRepetitions([1, 2, 1, 2, 1, 2, 1, 2, 3]), [1, 2, 1, 2, 3])
-        XCTAssertEqual(LiveText.capRepetitions([5, 5, 5, 5]), [5, 5])
-        XCTAssertEqual(LiveText.capRepetitions([1, 2, 3, 1, 2, 3]), [1, 2, 3, 1, 2, 3])
-    }
-}
-
 final class LiveTextLayoutTests: XCTestCase {
     private let width = IndicatorWindow.liveTextWidth
     private let lines = IndicatorWindow.liveTextLines
