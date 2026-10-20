@@ -223,15 +223,15 @@ final class StartHiddenPreferenceTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        originalValue = UserDefaults.standard.object(forKey: key)
-        UserDefaults.standard.removeObject(forKey: key)
+        originalValue = AppPreferences.store.object(forKey: key)
+        AppPreferences.store.removeObject(forKey: key)
     }
 
     override func tearDown() {
         if let originalValue {
-            UserDefaults.standard.set(originalValue, forKey: key)
+            AppPreferences.store.set(originalValue, forKey: key)
         } else {
-            UserDefaults.standard.removeObject(forKey: key)
+            AppPreferences.store.removeObject(forKey: key)
         }
         super.tearDown()
     }
@@ -243,9 +243,24 @@ final class StartHiddenPreferenceTests: XCTestCase {
     func testStartHiddenInMenuBar_persistsChanges() {
         AppPreferences.shared.startHiddenInMenuBar = true
         XCTAssertTrue(AppPreferences.shared.startHiddenInMenuBar)
-        XCTAssertTrue(UserDefaults.standard.bool(forKey: key))
+        XCTAssertEqual(AppPreferences.store.object(forKey: key) as? Bool, true)
 
         AppPreferences.shared.startHiddenInMenuBar = false
         XCTAssertFalse(AppPreferences.shared.startHiddenInMenuBar)
+    }
+}
+
+final class PreferenceIsolationTests: XCTestCase {
+    func testTestsNeverWriteTheUsersPreferences() {
+        XCTAssertFalse(AppPreferences.store is UserDefaults)
+        let key = "selectedWhisperModelPath"
+        let usersValue = UserDefaults.standard.object(forKey: key) as? String
+        let original = AppPreferences.shared.selectedWhisperModelPath
+        defer { AppPreferences.shared.selectedWhisperModelPath = original }
+
+        AppPreferences.shared.selectedWhisperModelPath = "/tmp/osw-isolation-check.bin"
+
+        XCTAssertEqual(AppPreferences.shared.selectedWhisperModelPath, "/tmp/osw-isolation-check.bin")
+        XCTAssertEqual(UserDefaults.standard.object(forKey: key) as? String, usersValue)
     }
 }

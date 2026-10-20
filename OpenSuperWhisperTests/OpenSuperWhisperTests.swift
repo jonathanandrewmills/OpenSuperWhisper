@@ -1127,7 +1127,7 @@ final class AddSpaceAfterSentenceTests: XCTestCase {
     }
     
     func testApplyPostProcessing_defaultPreferenceIsEnabled() {
-        UserDefaults.standard.removeObject(forKey: "addSpaceAfterSentence")
+        AppPreferences.store.removeObject(forKey: "addSpaceAfterSentence")
         let result = IndicatorViewModel.applyPostProcessing("Test.")
         XCTAssertEqual(result, "Test. ")
     }
@@ -1370,7 +1370,9 @@ final class NoMicrophoneGuardTests: XCTestCase {
 
     func testIndicatorViewModel_startRecording_withNoMicrophone_showsNoMicrophoneState() {
         withNoMicrophone {
-            let viewModel = IndicatorViewModel()
+            // The shared service may still be loading its engine, which the
+            // indicator reports as busy before it checks the microphone.
+            let viewModel = IndicatorViewModel(transcriptionService: TranscriptionService(engine: NamedTestEngine("idle")))
             viewModel.startRecording()
 
             XCTAssertTrue(viewModel.state == .noMicrophone,
@@ -1403,15 +1405,15 @@ final class EscapeCancelConfirmationTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        savedPrefValue = UserDefaults.standard.object(forKey: prefsKey)
-        UserDefaults.standard.removeObject(forKey: prefsKey)
+        savedPrefValue = AppPreferences.store.object(forKey: prefsKey)
+        AppPreferences.store.removeObject(forKey: prefsKey)
     }
 
     override func tearDown() {
         if let savedPrefValue {
-            UserDefaults.standard.set(savedPrefValue, forKey: prefsKey)
+            AppPreferences.store.set(savedPrefValue, forKey: prefsKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: prefsKey)
+            AppPreferences.store.removeObject(forKey: prefsKey)
         }
         super.tearDown()
     }
@@ -1447,7 +1449,7 @@ final class EscapeCancelConfirmationTests: XCTestCase {
     }
 
     func testLongRecording_withToggleEnabled_cancelsImmediately() {
-        UserDefaults.standard.set(true, forKey: prefsKey)
+        AppPreferences.store.set(true, forKey: prefsKey)
         let viewModel = makeRecordingViewModel(elapsed: 15)
 
         XCTAssertTrue(viewModel.handleCancelRequest(),

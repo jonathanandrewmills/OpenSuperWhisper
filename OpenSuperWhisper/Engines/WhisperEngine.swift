@@ -21,8 +21,9 @@ private class ProgressContext {
     }
 }
 
-/// Thread-safe cancellation flag. Owned by the engine for its whole lifetime,
-/// so the pointer passed into whisper's C callback can never dangle.
+/// Thread-safe cancellation flag. Owned by the engine (or a live decoder) for
+/// its whole lifetime, so the pointer passed into whisper's C callback can
+/// never dangle.
 private final class AbortFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var _isSet = false
@@ -56,6 +57,14 @@ class WhisperEngine: TranscriptionEngine {
         let segments: [DecodedSegment]
     }
 
+    /// Raw output of one whisper_full call, before any cleanup.
+    fileprivate struct DecodedPass {
+        var segments: [DecodedSegment] = []
+        var segmentTexts: [String] = []
+        var tokens: [WhisperToken] = []
+        var languageID = -1
+    }
+
     var engineName: String { "Whisper" }
     
     /// Silero VAD model shipped in the app bundle; always used to drop
@@ -65,6 +74,9 @@ class WhisperEngine: TranscriptionEngine {
     
     private var context: MyWhisperContext?
     private var vadContext: MyWhisperVadContext?
+    /// Created when recording starts, so the decode after release does not
+    /// pay for allocating it.
+    private var preparedState: MyWhisperState?
     private let abortFlag = AbortFlag()
     private var progressContext: ProgressContext?
     
@@ -74,15 +86,26 @@ class WhisperEngine: TranscriptionEngine {
         context != nil
     }
 
-    var hasPreparedState: Bool { context?.hasState == true }
+    var hasPreparedState: Bool { preparedState != nil }
 
     func prepareForRecording() throws {
         guard let context else {
             throw TranscriptionError.contextInitializationFailed
         }
-        if !context.hasState && !context.initState() {
+        if preparedState == nil {
+            guard let state = context.makeState() else {
+                throw TranscriptionError.contextInitializationFailed
+            }
+            preparedState = state
+        }
+    }
+
+    /// A decoder for live transcription with its own state on this model.
+    func makeLiveDecoder(settings: Settings) throws -> WhisperLiveDecoder {
+        guard let context else {
             throw TranscriptionError.contextInitializationFailed
         }
+        return try WhisperLiveDecoder(context: context, settings: settings)
     }
     
     private let modelPath: String?
@@ -92,6 +115,7 @@ class WhisperEngine: TranscriptionEngine {
     }
 
     func unload() {
+        preparedState = nil
         context = nil
         vadContext = nil
     }
@@ -149,10 +173,10 @@ class WhisperEngine: TranscriptionEngine {
     ) async throws -> DetailedTranscription {
         try Task.checkCancellation()
 
-        guard let context = context else {
+        guard let context = context, let vadContext else {
             throw TranscriptionError.contextInitializationFailed
         }
-        defer { context.freeState() }
+        defer { preparedState = nil }
         
         abortFlag.isSet = false
         try Task.checkCancellation()
@@ -189,15 +213,55 @@ class WhisperEngine: TranscriptionEngine {
         
         try Task.checkCancellation()
         
+        // Fresh decoding state per recording: isolates prompt_past between
+        // recordings (a hallucination on silence cannot poison the next one).
+        guard let pass = try Self.decodePass(
+            samples: converted,
+            settings: settings,
+            context: context,
+            vad: vadContext,
+            abortFlag: abortFlag,
+            progressContext: progressContext,
+            makeState: {
+                try self.prepareForRecording()
+                return self.preparedState!
+            }
+        ) else {
+            return DetailedTranscription(text: "", segments: [])
+        }
+
+        let text = Self.cleanedTranscript(
+            Self.assembleSegmentTexts(pass.segmentTexts, showTimestamps: settings.showTimestamps),
+            settings: settings
+        )
+        return DetailedTranscription(text: text, segments: pass.segments)
+    }
+
+    /// One whisper_full call over 16 kHz audio: the Silero trim, the user's
+    /// decode settings and the native decode. The batch path and live chunk
+    /// passes both decode here, so a chunk is decoded exactly like a short
+    /// recording. Returns nil when Silero hears no speech.
+    fileprivate static func decodePass(
+        samples converted: [Float],
+        settings: Settings,
+        context: MyWhisperContext,
+        vad: MyWhisperVadContext,
+        abortFlag: AbortFlag,
+        progressContext: ProgressContext?,
+        adjustParams: (inout WhisperFullParams) -> Void = { _ in },
+        makeState: () throws -> MyWhisperState
+    ) throws -> DecodedPass? {
         // VAD gate: whisper never sees non-speech audio, so silence cannot
         // produce hallucinated text and long pauses are not decoded at all.
         // (whisper_full_with_state has no built-in VAD path — params.vad works
         // only through whisper_full, which would share decoding state.)
-        let speechSegments = try detectSpeech(in: converted)
+        guard let speechSegments = vad.speechSegments(in: converted) else {
+            throw TranscriptionError.processingFailed
+        }
         try Task.checkCancellation()
         if abortFlag.isSet { throw CancellationError() }
         if speechSegments.isEmpty {
-            return DetailedTranscription(text: "", segments: [])
+            return nil
         }
         // Timestamps of the trimmed audio would not match the original file,
         // so trimming is applied only when timestamps are not requested.
@@ -240,25 +304,24 @@ class WhisperEngine: TranscriptionEngine {
             }
         }
         
-        let progressContextPtr = Unmanaged.passUnretained(progressContext!).toOpaque()
-        params.progressCallback = progressCallback
-        params.progressCallbackUserData = progressContextPtr
+        if let progressContext {
+            params.progressCallback = progressCallback
+            params.progressCallbackUserData = Unmanaged.passUnretained(progressContext).toOpaque()
+        }
         
         if settings.useBeamSearch {
             params.beamSearchBeamSize = Int32(settings.beamSize)
         }
+        adjustParams(&params)
+
+        try Task.checkCancellation()
+        let state = try makeState()
         
         var cParams = params.toC()
         cParams.abort_callback = abortCallback
         cParams.abort_callback_user_data = Unmanaged.passUnretained(abortFlag).toOpaque()
         
-        try Task.checkCancellation()
-        
-        // Fresh decoding state per recording: isolates prompt_past between
-        // recordings (a hallucination on silence cannot poison the next one).
-        try prepareForRecording()
-        
-        guard context.full(samples: samples, params: &cParams) else {
+        guard context.full(samples: samples, params: &cParams, state: state) else {
             if abortFlag.isSet || Task.isCancelled {
                 throw CancellationError()
             }
@@ -267,54 +330,51 @@ class WhisperEngine: TranscriptionEngine {
         
         try Task.checkCancellation()
         
-        var segmentTexts: [String] = []
-        var decodedSegments: [DecodedSegment] = []
-        let nSegments = context.fullNSegments
-        segmentTexts.reserveCapacity(nSegments)
-        decodedSegments.reserveCapacity(nSegments)
+        var pass = DecodedPass()
+        let nSegments = state.segmentCount
+        pass.segmentTexts.reserveCapacity(nSegments)
+        pass.segments.reserveCapacity(nSegments)
         
         for i in 0..<nSegments {
             if i % 5 == 0 {
                 try Task.checkCancellation()
             }
             
-            guard let segmentText = context.fullGetSegmentText(iSegment: i) else { continue }
-            let segmentEnd = context.fullGetSegmentT1(iSegment: i)
-            decodedSegments.append(
+            guard let segmentText = state.segmentText(i) else { continue }
+            let segmentEnd = state.segmentT1(i)
+            pass.segments.append(
                 DecodedSegment(
                     text: segmentText,
                     endTimeCentiseconds: segmentEnd
                 )
             )
+            pass.tokens.append(contentsOf: state.segmentTextTokens(i))
             
             if settings.showTimestamps {
-                let t0 = context.fullGetSegmentT0(iSegment: i)
-                segmentTexts.append(
+                let t0 = state.segmentT0(i)
+                pass.segmentTexts.append(
                     String(format: "[%.1f->%.1f] ", Float(t0) / 100.0, Float(segmentEnd) / 100.0)
                         + segmentText
                 )
             } else {
-                segmentTexts.append(segmentText)
+                pass.segmentTexts.append(segmentText)
             }
         }
+        pass.languageID = state.languageID
+        return pass
+    }
         
-        let cleanedText = Self.assembleSegmentTexts(
-            segmentTexts,
-            showTimestamps: settings.showTimestamps
-        )
+    /// The cleanup applied once to a whole dictation's text.
+    static func cleanedTranscript(_ text: String, settings: Settings) -> String {
+        let cleanedText = text
             .replacingOccurrences(of: "[MUSIC]", with: "")
             .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         
-        var processedText = cleanedText
         if settings.shouldApplyAsianAutocorrect && !cleanedText.isEmpty {
-            processedText = AutocorrectWrapper.format(cleanedText)
+            return AutocorrectWrapper.format(cleanedText)
         }
-        
-        return DetailedTranscription(
-            text: processedText,
-            segments: decodedSegments
-        )
+        return cleanedText
     }
 
     /// Whisper segments are decoder boundaries, not paragraph boundaries.
@@ -369,16 +429,6 @@ class WhisperEngine: TranscriptionEngine {
     }
     
     // MARK: - VAD
-    
-    private func detectSpeech(in samples: [Float]) throws -> [WhisperVadSegment] {
-        guard let vadContext else {
-            throw TranscriptionError.contextInitializationFailed
-        }
-        guard let segments = vadContext.speechSegments(in: samples) else {
-            throw TranscriptionError.processingFailed
-        }
-        return segments
-    }
     
     /// Keeps only speech, mirroring upstream whisper_full VAD stitching:
     /// each segment (already padded by the VAD) gets 0.1s of the following
@@ -662,5 +712,152 @@ class WhisperEngine: TranscriptionEngine {
             interleaved: false,
             channelLayout: channelLayout
         )
+    }
+}
+
+/// Decodes live-transcription chunks on its own whisper_state, sharing the
+/// engine's loaded model. It has its own Silero context for the trim because
+/// the engine's may be in use by a file transcription at the same time.
+final class WhisperLiveDecoder: LiveDecoding {
+    private let context: MyWhisperContext
+    private let settings: Settings
+    private let abortFlag = AbortFlag()
+    private let initialPromptTokens: [WhisperToken]
+    private let carriesInitialPrompt: Bool
+    private let promptCapacity: Int
+
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var state: MyWhisperState?
+    private var vad: MyWhisperVadContext?
+
+    fileprivate init(context: MyWhisperContext, settings: Settings) throws {
+        guard let state = context.makeState(),
+              let path = WhisperEngine.vadModelPath,
+              let vad = MyWhisperVadContext(modelPath: path) else {
+            throw TranscriptionError.contextInitializationFailed
+        }
+        self.context = context
+        self.settings = settings
+        self.state = state
+        self.vad = vad
+        initialPromptTokens = settings.initialPrompt.isEmpty ? [] : context.tokens(text: settings.initialPrompt)
+        let params = WhisperEngine.makeFullParams(
+            settings: settings,
+            nThreads: 1,
+            modelTextContext: context.nTextCtx,
+            initialPromptTokenCount: initialPromptTokens.count
+        )
+        carriesInitialPrompt = params.carryInitialPrompt
+        promptCapacity = Int(params.nMaxTextCtx)
+    }
+
+    func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult {
+        guard let pass = try decode(samples, history: history, language: language, preview: false) else {
+            return LiveChunkResult(text: "", tokens: [], detectedLanguage: nil)
+        }
+        let detected = settings.selectedLanguage == "auto" && pass.languageID >= 0
+            ? MyWhisperContext.langStr(id: pass.languageID)
+            : nil
+        return LiveChunkResult(
+            text: WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false),
+            tokens: pass.tokens,
+            detectedLanguage: detected
+        )
+    }
+
+    func decodePreview(_ samples: [Float], history: [WhisperToken], language: String?) throws -> String {
+        guard let pass = try decode(samples, history: history, language: language, preview: true) else { return "" }
+        return WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false)
+    }
+
+    private func decode(
+        _ samples: [Float],
+        history: [WhisperToken],
+        language: String?,
+        preview: Bool
+    ) throws -> WhisperEngine.DecodedPass? {
+        let (state, vad) = try beginPass(clearingAbort: !preview)
+        // Without earlier text the chunk is decoded exactly as the batch path
+        // decodes a recording, so a dictation with no cut gets today's text.
+        let prompt = history.isEmpty ? nil : LivePrompt.tokens(
+            initialPrompt: initialPromptTokens,
+            carriesInitialPrompt: carriesInitialPrompt,
+            history: history,
+            capacity: promptCapacity
+        )
+        return try WhisperEngine.decodePass(
+            samples: samples,
+            settings: settings,
+            context: context,
+            vad: vad,
+            abortFlag: abortFlag,
+            progressContext: nil,
+            adjustParams: { params in
+                // The state is reused by every pass of the recording, so each
+                // pass starts from the prompt built here, not the last pass's.
+                params.noContext = true
+                if let prompt {
+                    params.promptTokens = prompt
+                    params.initialPrompt = nil
+                    params.carryInitialPrompt = false
+                }
+                if let language {
+                    params.language = language
+                }
+                if preview {
+                    // Display only: one greedy candidate, and no temperature
+                    // fallback, whose retries cost seconds and buy nothing
+                    // when a word only counts once two passes agree.
+                    params.strategy = .greedy
+                    params.greedyBestOf = 1
+                    params.temperature = 0
+                    params.temperatureInc = 0
+                }
+            },
+            makeState: { state }
+        )
+    }
+
+    /// A chunk pass clears an abort left over from a preview. A preview
+    /// keeps a pending abort: the session clears it before others may abort
+    /// the preview, so an abort sent as the preview starts is not lost.
+    private func beginPass(clearingAbort: Bool) throws -> (MyWhisperState, MyWhisperVadContext) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isCancelled else { throw CancellationError() }
+        guard let state, let vad else { throw TranscriptionError.contextInitializationFailed }
+        if clearingAbort {
+            abortFlag.isSet = false
+        }
+        return (state, vad)
+    }
+
+    func resetAbort() {
+        lock.lock()
+        if !isCancelled {
+            abortFlag.isSet = false
+        }
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        abortFlag.isSet = true
+        lock.unlock()
+    }
+
+    func abortCurrentPass() {
+        lock.lock()
+        abortFlag.isSet = true
+        lock.unlock()
+    }
+
+    func close() {
+        lock.lock()
+        state = nil
+        vad = nil
+        lock.unlock()
     }
 }

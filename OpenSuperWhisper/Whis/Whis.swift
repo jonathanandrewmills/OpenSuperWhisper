@@ -27,6 +27,9 @@ public struct WhisperVadSegment {
 }
 
 public class MyWhisperVadContext {
+    /// Silero at 16 kHz scores one probability per 512-sample (32 ms) frame.
+    public static let frameSampleCount = 512
+
     private var vctx: OpaquePointer?
     
     public init?(modelPath: String) {
@@ -40,6 +43,26 @@ public class MyWhisperVadContext {
         if let vctx = vctx {
             whisper_vad_free(vctx)
         }
+    }
+
+    /// Starts a new stream: the LSTM state buffer is not zeroed at load.
+    public func resetStreamingState() {
+        guard let vctx = vctx else { return }
+        whisper_vad_reset_state(vctx)
+    }
+
+    /// Scores whole frames while keeping Silero's LSTM state between calls,
+    /// so a recording can be probed block by block as it arrives. A partial
+    /// frame would be zero-padded and corrupt that state, so callers pass a
+    /// multiple of frameSampleCount.
+    public func streamingSpeechProbabilities(for samples: ArraySlice<Float>) -> [Float]? {
+        guard let vctx = vctx, !samples.isEmpty,
+              samples.count % Self.frameSampleCount == 0 else { return nil }
+        let detected = samples.withUnsafeBufferPointer { buffer in
+            whisper_vad_detect_speech_no_reset(vctx, buffer.baseAddress, Int32(buffer.count))
+        }
+        guard detected, let probs = whisper_vad_probs(vctx) else { return nil }
+        return Array(UnsafeBufferPointer(start: probs, count: Int(whisper_vad_n_probs(vctx))))
     }
     
     public func speechSegments(in samples: [Float]) -> [WhisperVadSegment]? {
@@ -61,6 +84,57 @@ public class MyWhisperVadContext {
             ))
         }
         return result
+    }
+}
+
+// MARK: - Decoding State
+
+/// A decoding state owned by the caller instead of the context. Several
+/// states can decode on one loaded model at the same time (whisper_full_parallel
+/// does the same), each with its own KV caches and prompt history. The state
+/// keeps its context alive, so the model is never freed under it.
+public final class MyWhisperState {
+    let context: MyWhisperContext
+    fileprivate let pointer: OpaquePointer
+
+    fileprivate init(context: MyWhisperContext, pointer: OpaquePointer) {
+        self.context = context
+        self.pointer = pointer
+    }
+
+    deinit {
+        whisper_free_state(pointer)
+    }
+
+    public var segmentCount: Int {
+        Int(whisper_full_n_segments_from_state(pointer))
+    }
+
+    public var languageID: Int {
+        Int(whisper_full_lang_id_from_state(pointer))
+    }
+
+    public func segmentText(_ index: Int) -> String? {
+        guard let cStr = whisper_full_get_segment_text_from_state(pointer, Int32(index)) else { return nil }
+        return String(cString: cStr)
+    }
+
+    public func segmentT0(_ index: Int) -> Int64 {
+        whisper_full_get_segment_t0_from_state(pointer, Int32(index))
+    }
+
+    public func segmentT1(_ index: Int) -> Int64 {
+        whisper_full_get_segment_t1_from_state(pointer, Int32(index))
+    }
+
+    /// Text tokens of a segment, without timestamps or other special tokens,
+    /// in the form whisper.cpp itself carries into later prompts.
+    public func segmentTextTokens(_ index: Int) -> [WhisperToken] {
+        let eot = context.tokenEot
+        let count = Int(whisper_full_n_tokens_from_state(pointer, Int32(index)))
+        return (0..<count)
+            .map { whisper_full_get_token_id_from_state(pointer, Int32(index), Int32($0)) }
+            .filter { $0 < eot }
     }
 }
 
@@ -135,6 +209,11 @@ public class MyWhisperContext {
             whisper_free_state(state)
             self.state = nil
         }
+    }
+
+    public func makeState() -> MyWhisperState? {
+        guard let ctx = ctx, let state = whisper_init_state(ctx) else { return nil }
+        return MyWhisperState(context: self, pointer: state)
     }
     
     // MARK: - OpenVINO
@@ -223,6 +302,14 @@ public class MyWhisperContext {
     public func tokenCount(text: String) -> Int {
         guard let ctx = ctx else { return 0 }
         return Int(text.withCString { whisper_token_count(ctx, $0) })
+    }
+
+    public func tokens(text: String) -> [WhisperToken] {
+        let count = tokenCount(text: text)
+        guard count > 0 else { return [] }
+        var tokens = [WhisperToken](repeating: 0, count: count)
+        let written = tokenize(text: text, tokens: &tokens, nMaxTokens: count)
+        return written > 0 ? Array(tokens.prefix(written)) : []
     }
     
     // MARK: - Language Handling
@@ -684,26 +771,43 @@ public class MyWhisperContext {
             } else {
                 result = whisper_full(ctx, params, buffer.baseAddress, Int32(samples.count))
             }
-            
-            // Free c-allocated strings
-            if let suppressRegex = params.suppress_regex {
-                free(UnsafeMutablePointer(mutating: suppressRegex))
-            }
-            if let initialPrompt = params.initial_prompt {
-                free(UnsafeMutablePointer(mutating: initialPrompt))
-            }
-            if let language = params.language {
-                free(UnsafeMutablePointer(mutating: language))
-            }
-            
-            // Free the allocated memory for grammar_rules
-            if let baseAddress = params.grammar_rules {
-                free(UnsafeMutableRawPointer(mutating: baseAddress))
-            }
+            Self.freeAllocations(of: params)
             return result
         }
         
         return result == 0
+    }
+
+    /// Decodes on a caller-owned state, leaving this context's own state alone.
+    public func full(samples: [Float], params: inout whisper_full_params, state: MyWhisperState) -> Bool {
+        guard let ctx = ctx, state.context === self else {
+            Self.freeAllocations(of: params)
+            return false
+        }
+        let result = samples.withUnsafeBufferPointer { buffer in
+            whisper_full_with_state(ctx, state.pointer, params, buffer.baseAddress, Int32(samples.count))
+        }
+        Self.freeAllocations(of: params)
+        return result == 0
+    }
+
+    /// Frees what WhisperFullParams.toC() allocated for one call.
+    private static func freeAllocations(of params: whisper_full_params) {
+        if let suppressRegex = params.suppress_regex {
+            free(UnsafeMutablePointer(mutating: suppressRegex))
+        }
+        if let initialPrompt = params.initial_prompt {
+            free(UnsafeMutablePointer(mutating: initialPrompt))
+        }
+        if let language = params.language {
+            free(UnsafeMutablePointer(mutating: language))
+        }
+        if let promptTokens = params.prompt_tokens {
+            UnsafeMutablePointer(mutating: promptTokens).deallocate()
+        }
+        if let baseAddress = params.grammar_rules {
+            free(UnsafeMutableRawPointer(mutating: baseAddress))
+        }
     }
     
     public func fullParallel(samples: [Float], params: inout WhisperFullParams, nProcessors: Int) -> Bool {

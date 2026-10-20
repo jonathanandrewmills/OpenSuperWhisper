@@ -27,6 +27,14 @@ class IndicatorViewModel: ObservableObject {
     @Published var isBlinking = false
     @Published var isConfirmingCancel = false
     @Published var recorder: AudioRecorder = .shared
+    /// The text of a live dictation, fitted to the card.
+    @Published private(set) var liveText: LivePreview?
+    
+    /// Live transcription shows its text in a wider card that grows with it;
+    /// without it the indicator is the compact card.
+    let usesLiveLayout: Bool
+    /// The live card's height as laid out, for the hide animation.
+    var liveCardHeight = IndicatorWindow.cardSize.height
     
     var recordingStartedAt: Date?
     
@@ -53,8 +61,10 @@ class IndicatorViewModel: ObservableObject {
         },
         cancelAudioRecording: @escaping () -> Void = {
             AudioRecorder.shared.cancelRecording()
-        }
+        },
+        usesLiveLayout: Bool = AppPreferences.shared.isLiveTranscriptionActive
     ) {
+        self.usesLiveLayout = usesLiveLayout
         self.recordingStore = recordingStore
         self.transcriptionService = transcriptionService
         self.transcriptionQueue = TranscriptionQueue.shared
@@ -95,6 +105,16 @@ class IndicatorViewModel: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        if usesLiveLayout {
+            transcriptionService.$livePreview
+                .sink { [weak self] preview in
+                    self?.liveText = preview.map {
+                        LiveTextLayout.fitting($0, width: IndicatorWindow.liveTextWidth, lines: IndicatorWindow.liveTextLines)
+                    }
+                }
+                .store(in: &cancellables)
+        }
     }
     
     var isTranscriptionBusy: Bool {
@@ -206,6 +226,7 @@ class IndicatorViewModel: ObservableObject {
                     self.recordingSessionID = nil
                 }
                 if let audio = await self.stopRecordingOperation() {
+                    self.transcriptionService.discardLiveTranscription(for: audio.url)
                     await self.transcriptionQueue.addFileToQueue(url: audio.url)
                 }
             }
@@ -222,11 +243,16 @@ class IndicatorViewModel: ObservableObject {
 
             guard let audio = await self.stopRecordingOperation() else {
                 print("!!! Not found record url !!!")
+                // Too short or failed: nobody will ask for its live text.
+                self.transcriptionService.discardLiveTranscription()
                 self.finishDecoding(sessionID: sessionID)
                 return
             }
             let tempURL = audio.url
             var savedRecording: Recording?
+            // An Esc before transcribeAudio takes the live session (during
+            // the stop tail) would otherwise leave it running.
+            defer { self.transcriptionService.discardLiveTranscription(for: tempURL) }
 
             do {
                 try Task.checkCancellation()
@@ -393,6 +419,8 @@ class IndicatorViewModel: ObservableObject {
 
         if state != .decoding {
             cancelAudioRecordingOperation()
+            // The recording is gone, and so is any text shown for it.
+            transcriptionService.discardLiveTranscription()
         }
         RecordingSessionController.shared.finish(recordingSessionID)
         recordingSessionID = nil
@@ -452,6 +480,22 @@ struct IndicatorWindow: View {
     static let appearOffset: CGFloat = 20
     static let appearInitialScale: CGFloat = 0.5
     
+    /// The live card is wider and grows upward from the compact card's
+    /// height to three lines of text; the panel leaves the same margins.
+    static let liveCardWidth: CGFloat = 360
+    /// The text lines up with the status label, after the 24 pt icon slot
+    /// and its 8 pt spacing, like the body of a notification.
+    static let liveTextIndent: CGFloat = 32
+    static let liveTextWidth = liveCardWidth - 48 - liveTextIndent
+    static let liveTextLines = 3
+    static let liveTextFontSize: CGFloat = 12
+    static let liveCardMaxHeight: CGFloat = 88
+    static let liveCardBottomInset = (windowSize.height - cardSize.height) / 2
+    static let liveWindowSize = CGSize(
+        width: liveCardWidth + (windowSize.width - cardSize.width),
+        height: liveCardMaxHeight + (windowSize.height - cardSize.height)
+    )
+    
     @ObservedObject var viewModel: IndicatorViewModel
     @Environment(\.colorScheme) private var colorScheme
     
@@ -462,79 +506,19 @@ struct IndicatorWindow: View {
     }
     
     var body: some View {
+        if viewModel.usesLiveLayout {
+            liveCard
+        } else {
+            compactCard
+        }
+    }
+
+    private var compactCard: some View {
 
         let rect = RoundedRectangle(cornerRadius: 24)
         
-        VStack(spacing: 12) {
-            switch viewModel.state {
-            case .connecting:
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                        .frame(width: 24)
-                    
-                    Text("Connecting...")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                
-            case .recording:
-                HStack(spacing: 8) {
-                    RecordingIndicator(isBlinking: viewModel.isBlinking)
-                        .frame(width: 24)
-                    
-                    if viewModel.isConfirmingCancel {
-                        Text("Press Esc to cancel")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.orange)
-                            .transition(.opacity)
-                    } else {
-                        Text("Recording...")
-                            .font(.system(size: 13, weight: .semibold))
-                            .transition(.opacity)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .animation(.easeInOut(duration: 0.2), value: viewModel.isConfirmingCancel)
-                
-            case .decoding:
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                        .frame(width: 24)
-                    
-                    Text("Transcribing...")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                
-            case .busy:
-                HStack(spacing: 8) {
-                    Image(systemName: "hourglass")
-                        .foregroundColor(.orange)
-                        .frame(width: 24)
-
-                    Text("Processing...")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.orange)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            case .noMicrophone:
-                HStack(spacing: 8) {
-                    Image(systemName: "mic.slash")
-                        .foregroundColor(.orange)
-                        .frame(width: 24)
-
-                    Text("No microphone")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.orange)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            case .idle:
-                EmptyView()
-            }
+        return VStack(spacing: 12) {
+            statusRow
         }
         .padding(.horizontal, 24)
         .frame(height: Self.cardSize.height)
@@ -564,6 +548,189 @@ struct IndicatorWindow: View {
         // frame in traces). IndicatorWindowManager animates the hosting view's
         // layer with CASpringAnimation instead: content is drawn once and the
         // spring runs entirely in the render server on the GPU.
+    }
+
+    /// The compact card's row on top, the live text below it. The card sits
+    /// at the bottom of the panel, so it grows upward, away from the caret.
+    /// Its text changes without animation: re-rendering the material card
+    /// is expensive, and the service limits changes to five a second.
+    private var liveCard: some View {
+        // At the compact height the corners make the same capsule ends.
+        let rect = RoundedRectangle(cornerRadius: Self.cardSize.height / 2)
+
+        return VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 4) {
+                statusRow
+                    .frame(height: Self.cardSize.height - 16)
+                if let text = viewModel.liveText, !text.isEmpty {
+                    (Text(text.settled).foregroundColor(.primary)
+                        + Text(text.unsettled).foregroundColor(.secondary))
+                        .font(.system(size: Self.liveTextFontSize))
+                        .lineLimit(Self.liveTextLines)
+                        .truncationMode(.head)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, Self.liveTextIndent)
+                        // Clears the cancel confirmation bar at the bottom.
+                        .padding(.bottom, 2)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 8)
+            .frame(width: Self.liveCardWidth)
+            .background {
+                rect
+                    .fill(backgroundColor)
+                    .background {
+                        rect
+                            .fill(Material.thinMaterial)
+                    }
+            }
+            .overlay(alignment: .bottom) {
+                if viewModel.isConfirmingCancel {
+                    CancelConfirmationBar()
+                }
+            }
+            .clipShape(rect)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: LiveCardHeightKey.self, value: proxy.size.height)
+                }
+            }
+            .padding(.bottom, Self.liveCardBottomInset)
+        }
+        .frame(width: Self.liveWindowSize.width, height: Self.liveWindowSize.height)
+        .onPreferenceChange(LiveCardHeightKey.self) { height in
+            viewModel.liveCardHeight = height
+        }
+    }
+
+    @ViewBuilder
+    private var statusRow: some View {
+        switch viewModel.state {
+        case .connecting:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.7)
+                    .frame(width: 24)
+                
+                Text("Connecting...")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            
+        case .recording:
+            HStack(spacing: 8) {
+                RecordingIndicator(isBlinking: viewModel.isBlinking)
+                    .frame(width: 24)
+                
+                if viewModel.isConfirmingCancel {
+                    Text("Press Esc to cancel")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.orange)
+                        .transition(.opacity)
+                } else {
+                    Text("Recording...")
+                        .font(.system(size: 13, weight: .semibold))
+                        .transition(.opacity)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(.easeInOut(duration: 0.2), value: viewModel.isConfirmingCancel)
+            
+        case .decoding:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.7)
+                    .frame(width: 24)
+                
+                Text("Transcribing...")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            
+        case .busy:
+            HStack(spacing: 8) {
+                Image(systemName: "hourglass")
+                    .foregroundColor(.orange)
+                    .frame(width: 24)
+
+                Text("Processing...")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.orange)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        case .noMicrophone:
+            HStack(spacing: 8) {
+                Image(systemName: "mic.slash")
+                    .foregroundColor(.orange)
+                    .frame(width: 24)
+
+                Text("No microphone")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.orange)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+        case .idle:
+            EmptyView()
+        }
+    }
+}
+
+private struct LiveCardHeightKey: PreferenceKey {
+    static let defaultValue = IndicatorWindow.cardSize.height
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// Fits live text into the card's lines by dropping its oldest words, so
+/// the newest words stay visible.
+enum LiveTextLayout {
+    static func fitting(_ preview: LivePreview, width: CGFloat, lines: Int) -> LivePreview {
+        let font = NSFont.systemFont(ofSize: IndicatorWindow.liveTextFontSize)
+        var settled = preview.settled
+        var unsettled = preview.unsettled
+        if settled.isEmpty {
+            unsettled = String(unsettled.drop(while: \.isWhitespace))
+        } else {
+            settled = String(settled.drop(while: \.isWhitespace))
+        }
+        let text = Array(settled + unsettled)
+        let maxHeight = CGFloat(lines) * NSLayoutManager().defaultLineHeight(for: font) + 0.5
+        func fits(_ candidate: String) -> Bool {
+            NSAttributedString(string: candidate, attributes: [.font: font])
+                .boundingRect(with: CGSize(width: width, height: .greatestFiniteMagnitude),
+                              options: [.usesLineFragmentOrigin, .usesFontLeading])
+                .height <= maxHeight
+        }
+        guard !fits(String(text)) else { return LivePreview(settled: settled, unsettled: unsettled) }
+
+        // Candidate starts: the first character of each word (or of each
+        // character in scripts written without spaces).
+        let starts = text.indices.filter { index in
+            !text[index].isWhitespace && (index == 0 || text[index - 1].isWhitespace
+                || LiveText.isUnspacedScript(text[index]) || LiveText.isUnspacedScript(text[index - 1]))
+        }
+        var low = 0
+        var high = starts.count - 1
+        while low < high {
+            let middle = (low + high) / 2
+            if fits("…" + String(text[starts[middle]...])) {
+                high = middle
+            } else {
+                low = middle + 1
+            }
+        }
+        let cut = starts.isEmpty ? 0 : starts[low]
+        if cut < settled.count {
+            return LivePreview(settled: "…" + String(text[cut..<settled.count]), unsettled: unsettled)
+        }
+        return LivePreview(settled: "…", unsettled: String(text[cut...]))
     }
 }
 

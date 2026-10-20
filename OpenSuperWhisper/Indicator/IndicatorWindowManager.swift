@@ -58,7 +58,10 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         
         // The card is centered inside a larger panel (margins for the appear
         // offset and shadow), so position the visible card, not the window.
-        let cardBottomInset = (windowFrame.height - IndicatorWindow.cardSize.height) / 2
+        // The live card sits at the bottom of its panel and grows upward.
+        let cardBottomInset = presentedViewModel.usesLiveLayout
+            ? IndicatorWindow.liveCardBottomInset
+            : (windowFrame.height - IndicatorWindow.cardSize.height) / 2
         
         var x: CGFloat
         var y: CGFloat
@@ -70,7 +73,7 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         } else {
             // Default: card top 100 points from the top center of screen
             x = screenFrame.midX - windowFrame.width / 2
-            y = screenFrame.maxY - 100 - windowFrame.height + cardBottomInset
+            y = screenFrame.maxY - 100 - IndicatorWindow.cardSize.height - cardBottomInset
         }
         
         // Adjust if out of screen bounds
@@ -127,15 +130,29 @@ class IndicatorWindowManager: IndicatorViewDelegate {
     /// coordinates, which on macOS have +y pointing up regardless of the
     /// view's flippedness, so "down" is a negative y translation.
     static func hiddenTransform(for view: NSView) -> CATransform3D {
-        let bounds = view.bounds
+        hiddenTransform(scalingAround: CGPoint(x: view.bounds.midX, y: view.bounds.midY))
+    }
+
+    /// The same around a given card center, in layer coordinates.
+    static func hiddenTransform(scalingAround center: CGPoint) -> CATransform3D {
         let scale = IndicatorWindow.appearInitialScale
-        var transform = CATransform3DMakeTranslation(bounds.midX, bounds.midY, 0)
+        var transform = CATransform3DMakeTranslation(center.x, center.y, 0)
         transform = CATransform3DScale(transform, scale, scale, 1)
-        transform = CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
+        transform = CATransform3DTranslate(transform, -center.x, -center.y, 0)
         return CATransform3DConcat(
             transform,
             CATransform3DMakeTranslation(0, -IndicatorWindow.appearOffset, 0)
         )
+    }
+    
+    /// The live card is not centered in its panel, so its springs scale
+    /// around the card's own center.
+    private func hiddenTransform(for view: NSView) -> CATransform3D {
+        guard let viewModel, viewModel.usesLiveLayout else { return Self.hiddenTransform(for: view) }
+        return Self.hiddenTransform(scalingAround: CGPoint(
+            x: view.bounds.midX,
+            y: IndicatorWindow.liveCardBottomInset + viewModel.liveCardHeight / 2
+        ))
     }
     
     private func animateAppear() {
@@ -147,7 +164,7 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         layer.transform = CATransform3DIdentity
         layer.opacity = 1
         layer.add(
-            Self.springAnimation(keyPath: "transform", from: Self.hiddenTransform(for: view), to: CATransform3DIdentity),
+            Self.springAnimation(keyPath: "transform", from: hiddenTransform(for: view), to: CATransform3DIdentity),
             forKey: "transform"
         )
         layer.add(Self.springAnimation(keyPath: "opacity", from: 0, to: 1), forKey: "opacity")
@@ -157,7 +174,7 @@ class IndicatorWindowManager: IndicatorViewDelegate {
     private func animateHide() async {
         guard let view = window?.contentView, let layer = view.layer, layer.opacity > 0 else { return }
         
-        let hidden = Self.hiddenTransform(for: view)
+        let hidden = hiddenTransform(for: view)
         // Start from the interrupted mid-flight state if the appear spring is
         // still running.
         let currentTransform = layer.presentation()?.transform ?? layer.transform
@@ -235,7 +252,7 @@ class IndicatorWindowManager: IndicatorViewDelegate {
             hostingView.wantsLayer = true
             window.contentView = hostingView
         }
-        window.setContentSize(IndicatorWindow.windowSize)
+        window.setContentSize(presentedViewModel.usesLiveLayout ? IndicatorWindow.liveWindowSize : IndicatorWindow.windowSize)
         window.contentView?.layoutSubtreeIfNeeded()
     }
     

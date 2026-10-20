@@ -128,3 +128,6 @@ dev_config.json
 agent/.venv/
 agent/logs/
 /libautocorrect/target/
+
+# Rendered architecture diagrams (Scripts/render_architecture.py)
+docs/architecture/*.html
