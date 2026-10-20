@@ -1,13 +1,44 @@
 import Foundation
 
+/// The subset of UserDefaults that preferences use.
+protocol PreferenceStore: AnyObject {
+    func object(forKey defaultName: String) -> Any?
+    func set(_ value: Any?, forKey defaultName: String)
+    func removeObject(forKey defaultName: String)
+}
+
+extension UserDefaults: PreferenceStore {}
+
+/// Preferences that live only as long as the process.
+final class InMemoryPreferenceStore: PreferenceStore {
+    private let lock = NSLock()
+    private var values: [String: Any] = [:]
+
+    func object(forKey defaultName: String) -> Any? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[defaultName]
+    }
+
+    func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[defaultName] = value
+    }
+
+    func removeObject(forKey defaultName: String) {
+        set(nil, forKey: defaultName)
+    }
+}
+
 @propertyWrapper
 struct UserDefault<T> {
     let key: String
     let defaultValue: T
     
     var wrappedValue: T {
-        get { UserDefaults.standard.object(forKey: key) as? T ?? defaultValue }
-        set { UserDefaults.standard.set(newValue, forKey: key) }
+        get { AppPreferences.store.object(forKey: key) as? T ?? defaultValue }
+        set { AppPreferences.store.set(newValue, forKey: key) }
     }
 }
 
@@ -16,21 +47,30 @@ struct OptionalUserDefault<T> {
     let key: String
     
     var wrappedValue: T? {
-        get { UserDefaults.standard.object(forKey: key) as? T }
-        set { UserDefaults.standard.set(newValue, forKey: key) }
+        get { AppPreferences.store.object(forKey: key) as? T }
+        set { AppPreferences.store.set(newValue, forKey: key) }
     }
 }
 
 final class AppPreferences {
     static let shared = AppPreferences()
+
+    /// Unit tests run inside the app, so with UserDefaults.standard they would
+    /// read and overwrite the user's real settings, and parallel test
+    /// processes would race on them. Each test process gets its own store.
+    static let store: PreferenceStore = OpenSuperWhisperApp.isRunningTests
+        ? InMemoryPreferenceStore()
+        : UserDefaults.standard
+
     private init() {
         migrateOldPreferences()
     }
     
     private func migrateOldPreferences() {
-        if let oldPath = UserDefaults.standard.string(forKey: "selectedModelPath"),
-           UserDefaults.standard.string(forKey: "selectedWhisperModelPath") == nil {
-            UserDefaults.standard.set(oldPath, forKey: "selectedWhisperModelPath")
+        let store = Self.store
+        if let oldPath = store.object(forKey: "selectedModelPath") as? String,
+           store.object(forKey: "selectedWhisperModelPath") as? String == nil {
+            store.set(oldPath, forKey: "selectedWhisperModelPath")
         }
     }
     
