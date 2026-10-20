@@ -2,7 +2,12 @@ import Foundation
 
 @MainActor
 class TranscriptionService: ObservableObject {
-    static let shared = TranscriptionService()
+    /// Unit tests run inside the app and build the engines they need, so there
+    /// the shared service never loads the user's model: a load still running
+    /// when the test process exits aborts in ggml's Metal teardown.
+    static let shared = OpenSuperWhisperApp.isRunningTests
+        ? TranscriptionService(engineLoader: { _ in throw TranscriptionError.contextInitializationFailed })
+        : TranscriptionService()
     
     @Published private(set) var isTranscribing = false
     @Published private(set) var transcribedText = ""

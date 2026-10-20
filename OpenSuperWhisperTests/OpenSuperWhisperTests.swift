@@ -1370,7 +1370,9 @@ final class NoMicrophoneGuardTests: XCTestCase {
 
     func testIndicatorViewModel_startRecording_withNoMicrophone_showsNoMicrophoneState() {
         withNoMicrophone {
-            let viewModel = IndicatorViewModel()
+            // The shared service may still be loading its engine, which the
+            // indicator reports as busy before it checks the microphone.
+            let viewModel = IndicatorViewModel(transcriptionService: TranscriptionService(engine: NamedTestEngine("idle")))
             viewModel.startRecording()
 
             XCTAssertTrue(viewModel.state == .noMicrophone,
