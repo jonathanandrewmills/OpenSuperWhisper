@@ -258,6 +258,8 @@ class ContentViewModel: ObservableObject {
                 }
             } else {
                 await MainActor.run {
+                    // Too short or failed: nobody will ask for its live text.
+                    self.transcriptionService.discardLiveTranscription()
                     self.state = .idle
                     self.recordingDuration = 0
                 }

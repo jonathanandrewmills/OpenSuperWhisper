@@ -243,11 +243,16 @@ class IndicatorViewModel: ObservableObject {
 
             guard let audio = await self.stopRecordingOperation() else {
                 print("!!! Not found record url !!!")
+                // Too short or failed: nobody will ask for its live text.
+                self.transcriptionService.discardLiveTranscription()
                 self.finishDecoding(sessionID: sessionID)
                 return
             }
             let tempURL = audio.url
             var savedRecording: Recording?
+            // An Esc before transcribeAudio takes the live session (during
+            // the stop tail) would otherwise leave it running.
+            defer { self.transcriptionService.discardLiveTranscription(for: tempURL) }
 
             do {
                 try Task.checkCancellation()
@@ -414,6 +419,8 @@ class IndicatorViewModel: ObservableObject {
 
         if state != .decoding {
             cancelAudioRecordingOperation()
+            // The recording is gone, and so is any text shown for it.
+            transcriptionService.discardLiveTranscription()
         }
         RecordingSessionController.shared.finish(recordingSessionID)
         recordingSessionID = nil

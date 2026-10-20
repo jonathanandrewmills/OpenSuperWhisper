@@ -360,6 +360,77 @@ final class LivePreviewServiceTests: XCTestCase {
         XCTAssertNil(service.livePreview, "A finished session's preview is ignored")
     }
 
+    /// Starts a live session for a recording at `url` and shows one preview.
+    private func startDictation(_ service: TranscriptionService, url: URL, onPreview: () -> ((LivePreview) -> Void)?) async throws {
+        service.prepareForRecording(liveAudio: LiveAudioBuffer(recordingURL: url))
+        try XCTUnwrap(onPreview())(LivePreview(settled: " discarded words", unsettled: ""))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertNotNil(service.livePreview)
+    }
+
+    private func waitUntilDropped(_ decoder: FakeLiveDecoder, _ service: TranscriptionService) async throws {
+        for _ in 0..<100 where !(decoder.isClosed && service.livePreview == nil) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    func testARecordingTooShortToKeepDropsItsLiveSession() async throws {
+        let decoder = FakeLiveDecoder()
+        let (service, onPreview) = makeService(decoder)
+        try await startDictation(service, url: FileManager.default.temporaryDirectory.appendingPathComponent("short-\(UUID()).wav"), onPreview: onPreview)
+        let viewModel = IndicatorViewModel(transcriptionService: service, stopRecording: { nil }, cancelAudioRecording: {})
+        defer { viewModel.cleanup() }
+        viewModel.state = .recording
+
+        viewModel.startDecoding()
+        try await waitUntilDropped(decoder, service)
+
+        XCTAssertTrue(decoder.isCancelled, "The live session's pass is aborted")
+        XCTAssertTrue(decoder.isClosed, "Its whisper state is freed")
+        XCTAssertNil(service.livePreview, "The next indicator must not show the discarded text")
+    }
+
+    func testEscDuringTheStopTailDropsTheLiveSession() async throws {
+        let decoder = FakeLiveDecoder()
+        let (service, onPreview) = makeService(decoder)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tail-\(UUID()).wav")
+        try await startDictation(service, url: url, onPreview: onPreview)
+        let viewModel = IndicatorViewModel(
+            transcriptionService: service,
+            stopRecording: {
+                // The 250 ms stop tail, during which Esc arrives.
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                return RecordedAudio(url: url, samples: [])
+            },
+            cancelAudioRecording: {}
+        )
+        defer { viewModel.cleanup() }
+        viewModel.state = .recording
+
+        viewModel.startDecoding()
+        viewModel.cancelRecording()
+        try await waitUntilDropped(decoder, service)
+
+        XCTAssertTrue(decoder.isClosed)
+        XCTAssertNil(service.livePreview)
+        XCTAssertFalse(service.isTranscribing)
+    }
+
+    func testEscWhileRecordingClearsTheLivePreview() async throws {
+        let decoder = FakeLiveDecoder()
+        let (service, onPreview) = makeService(decoder)
+        try await startDictation(service, url: FileManager.default.temporaryDirectory.appendingPathComponent("esc-\(UUID()).wav"), onPreview: onPreview)
+        let viewModel = IndicatorViewModel(transcriptionService: service, stopRecording: { nil }, cancelAudioRecording: {})
+        defer { viewModel.cleanup() }
+        viewModel.state = .recording
+
+        viewModel.cancelRecording()
+        try await waitUntilDropped(decoder, service)
+
+        XCTAssertTrue(decoder.isClosed)
+        XCTAssertNil(service.livePreview)
+    }
+
     func testTheLiveIndicatorShowsTheFittedPreview() async throws {
         let decoder = FakeLiveDecoder()
         let (service, onPreview) = makeService(decoder)

@@ -119,7 +119,7 @@ class TranscriptionService: ObservableObject {
             liveAudio?.cancel()
             return
         }
-        if let liveAudio {
+        if let liveAudio, !liveAudio.isCancelled {
             if startLiveTranscription(audio: liveAudio, engine: engine) { return }
             liveAudio.cancel()
         }
