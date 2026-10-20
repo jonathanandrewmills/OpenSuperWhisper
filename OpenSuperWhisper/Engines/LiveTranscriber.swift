@@ -344,6 +344,8 @@ final class LiveTranscriber: @unchecked Sendable {
     private var language: String?
     private var failure: Error?
     private var isFinishing = false
+    /// The saved recording, once finish() hands it over.
+    private var finalSamples: [Float]?
     private var agreement = LiveAgreement()
     /// Settled preview words of chunks that are cut but not decoded yet.
     private var pendingPreviewTexts: [String] = []
@@ -404,12 +406,17 @@ final class LiveTranscriber: @unchecked Sendable {
     /// Decodes whatever the recording still holds and returns every chunk's
     /// text. The audio must be finished. Throws when a pass failed, so the
     /// caller can decode the whole recording the usual way instead.
-    func finish() async throws -> LiveTranscript {
+    ///
+    /// `recordedSamples` are the recording's saved samples. What is left to
+    /// decode at release is taken from them, so a dictation with no cut is
+    /// decoded from exactly the samples the batch path would decode, even
+    /// where the live mix of a multi-channel input differs from the saved one.
+    func finish(recordedSamples: [Float]? = nil) async throws -> LiveTranscript {
         requestFinish()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
-                    continuation.resume(with: Result { try self.finishOnQueue() })
+                    continuation.resume(with: Result { try self.finishOnQueue(recordedSamples: recordedSamples) })
                 }
             }
         } onCancel: {
@@ -617,7 +624,8 @@ final class LiveTranscriber: @unchecked Sendable {
         guard !isCancelled else { throw CancellationError() }
         guard let decoder else { throw TranscriptionError.contextInitializationFailed }
         let started = Date()
-        let result = try decoder.decodeChunk(audio.samples(in: range), history: history, language: language)
+        let samples = finalSamples.map { Array($0[range]) } ?? audio.samples(in: range)
+        let result = try decoder.decodeChunk(samples, history: history, language: language)
         chunks.append(LiveTranscript.Chunk(samples: range, text: result.text, followsForcedCut: followsForcedCut))
         history = Array((history + result.tokens).suffix(parameters.historyTokenLimit))
         if language == nil {
@@ -631,12 +639,15 @@ final class LiveTranscriber: @unchecked Sendable {
         ))
     }
 
-    private func finishOnQueue() throws -> LiveTranscript {
+    private func finishOnQueue(recordedSamples: [Float]?) throws -> LiveTranscript {
         isFinishing = true
         defer { closeResources() }
         if isCancelled { throw CancellationError() }
         if let failure { throw failure }
         guard audio.isFinished else { throw LiveTranscriptionError.audioNotFinished }
+        if let recordedSamples, recordedSamples.count == audio.count {
+            finalSamples = recordedSamples
+        }
         do {
             try probeAudio(final: true)
             try decodeCutChunks()

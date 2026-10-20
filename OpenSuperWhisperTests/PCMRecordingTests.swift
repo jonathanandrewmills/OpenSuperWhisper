@@ -116,6 +116,39 @@ final class PCMRecordingTests: XCTestCase {
         }
     }
 
+    func testAChannelThatCarriedSignalStaysInTheLiveMix() throws {
+        // A second input that is live for half a second, then idle: the live
+        // level must not jump back up when it goes quiet.
+        let rate = 16000.0
+        let layout = try XCTUnwrap(AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 2))
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,
+                                                interleaved: false, channelLayout: layout))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("pcm-sticky-\(UUID()).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try PCMRecordingWriter(url: url, inputFormat: format)
+        var live: [Float] = []
+        writer.onMonoBlock = { live.append(contentsOf: $0) }
+        let frameCount = Int(rate * 3)
+        for offset in stride(from: 0, to: frameCount, by: 1024) {
+            let count = min(1024, frameCount - offset)
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)))
+            buffer.frameLength = AVAudioFrameCount(count)
+            for frame in 0..<count {
+                let time = Double(offset + frame) / rate
+                buffer.floatChannelData![0][frame] = Float(0.2 * sin(time * 300 * 2 * .pi))
+                buffer.floatChannelData![1][frame] = time >= 1 && time < 1.5 ? Float(0.01 * sin(time * 437 * 2 * .pi)) : 0
+            }
+            try writer.append(buffer)
+        }
+        _ = try writer.finish()
+
+        func peak(_ seconds: ClosedRange<Double>) -> Float {
+            live[Int(seconds.lowerBound * rate)..<Int(seconds.upperBound * rate)].map(abs).max() ?? 0
+        }
+        XCTAssertEqual(peak(0.1...0.9), 0.2, accuracy: 0.01, "Only the first input carries signal at first")
+        XCTAssertEqual(peak(2.0...2.9), 0.1, accuracy: 0.01, "Once the second input has carried signal, it stays averaged in")
+    }
+
     @MainActor
     func testServiceDecodesPreparedAudioWithoutReadingTheFile() async throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()

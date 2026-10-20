@@ -21,6 +21,8 @@ final class PCMRecordingWriter {
     private var channels: [[Float]]
     /// Receives every converted block mixed to mono, for live transcription.
     var onMonoBlock: (([Float]) -> Void)?
+    /// Channels that have carried signal so far in the live mix.
+    private var liveChannels = Set<Int>()
 
     init(url: URL, inputFormat: AVAudioFormat) throws {
         self.url = url
@@ -91,27 +93,34 @@ final class PCMRecordingWriter {
                 }
             }
             if let onMonoBlock {
-                onMonoBlock(Self.monoBlock(from: data, frames: Int(output.frameLength), channels: count))
+                onMonoBlock(monoBlock(from: data, frames: Int(output.frameLength), channels: count))
             }
         }
     }
 
-    /// One block mixed with the rule mixedSamples() applies per chunk: average
-    /// the channels that carry signal. For a mono input the blocks add up to
-    /// exactly the samples finish() returns.
-    private static func monoBlock(from data: UnsafePointer<Int16>, frames: Int, channels: Int) -> [Float] {
+    /// One block mixed with the rule mixedSamples() uses: average the
+    /// channels that carry signal. For a mono input the blocks add up to
+    /// exactly the samples finish() returns. mixedSamples() decides over
+    /// windows that depend on the recording's final length, which a live
+    /// mix cannot know, so here a channel that has carried signal stays in
+    /// the mix: deciding per block would let a channel idling near the
+    /// threshold drop in and out, changing the level by 6 dB from one block
+    /// to the next. The release path decodes from the saved samples.
+    private func monoBlock(from data: UnsafePointer<Int16>, frames: Int, channels: Int) -> [Float] {
         if channels == 1 {
             return (0..<frames).map { Float(data[$0]) / 32768 }
         }
-        let active = (0..<channels).filter { channel in
+        for channel in 0..<channels where !liveChannels.contains(channel) {
             var energy: Float = 0
             for frame in 0..<frames {
                 let sample = Float(data[frame * channels + channel]) / 32768
                 energy += sample * sample
             }
-            return sqrtf(energy / Float(frames)) > 0.0001
+            if sqrtf(energy / Float(frames)) > 0.0001 {
+                liveChannels.insert(channel)
+            }
         }
-        let selected = active.isEmpty ? Array(0..<channels) : active
+        let selected = liveChannels.isEmpty ? Array(0..<channels) : liveChannels.sorted()
         let normalization = 1 / Float(selected.count)
         return (0..<frames).map { frame in
             var sample: Float = 0

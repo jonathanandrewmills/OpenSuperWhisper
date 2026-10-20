@@ -508,7 +508,7 @@ class TranscriptionService: ObservableObject {
         pcmSamples: [Float]?
     ) async throws -> String {
         do {
-            let transcript = try await live.finish()
+            let transcript = try await live.finish(recordedSamples: pcmSamples)
             return WhisperEngine.cleanedTranscript(transcript.text, settings: settings)
         } catch {
             try Task.checkCancellation()

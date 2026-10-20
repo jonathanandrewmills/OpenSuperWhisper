@@ -266,6 +266,8 @@ final class AmplitudeSpeechProbe: SpeechProbing {
 final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
     struct Call {
         let sampleCount: Int
+        /// The loudest sample, which tells the test which audio was decoded.
+        let peak: Float
         let history: [WhisperToken]
         let language: String?
     }
@@ -323,7 +325,7 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
     func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult {
         lock.lock()
         let index = callsStorage.count
-        callsStorage.append(Call(sampleCount: samples.count, history: history, language: language))
+        callsStorage.append(Call(sampleCount: samples.count, peak: samples.map(abs).max() ?? 0, history: history, language: language))
         let held = heldPasses.contains(index)
         let started = startedSignals[index]
         let release = releaseSignals[index]
@@ -552,6 +554,44 @@ final class LiveTranscriberTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? LiveTranscriptionError, .audioNotFinished)
         }
+    }
+
+    func testWhatIsLeftAtReleaseIsDecodedFromTheRecordedSamples() async throws {
+        let decoder = FakeLiveDecoder()
+        let (transcriber, buffer) = makeTranscriber(decoder)
+        let live = audio([(10, true), (1, false), (4, true)])
+        feed(live, to: buffer)
+        await transcriber.waitUntilIdle()
+        buffer.finish()
+        // A multi-channel input's saved mix can differ from the live one.
+        let recorded = live.map { $0 / 2 }
+        _ = try await transcriber.finish(recordedSamples: recorded)
+
+        XCTAssertEqual(decoder.calls.map(\.peak), [0.5, 0.25],
+                       "The chunk decoded while recording used the live mix; the last one, the saved samples")
+    }
+
+    func testAShortDictationIsDecodedFromExactlyTheRecordedSamples() async throws {
+        let decoder = FakeLiveDecoder()
+        let (transcriber, buffer) = makeTranscriber(decoder)
+        let live = audio([(6, true)])
+        feed(live, to: buffer)
+        buffer.finish()
+        _ = try await transcriber.finish(recordedSamples: live.map { $0 / 2 })
+
+        XCTAssertEqual(decoder.calls.map(\.peak), [0.25])
+        XCTAssertEqual(decoder.calls.map(\.sampleCount), [live.count])
+    }
+
+    func testRecordedSamplesOfAnotherLengthAreNotUsed() async throws {
+        let decoder = FakeLiveDecoder()
+        let (transcriber, buffer) = makeTranscriber(decoder)
+        let live = audio([(6, true)])
+        feed(live, to: buffer)
+        buffer.finish()
+        _ = try await transcriber.finish(recordedSamples: Array(repeating: 0.25, count: live.count - 1))
+
+        XCTAssertEqual(decoder.calls.map(\.peak), [0.5])
     }
 
     func testChunksRecordWhetherTheyStartAtAForcedCut() async throws {
