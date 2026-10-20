@@ -31,15 +31,20 @@ enum LiveText {
         return result
     }
 
-    /// Joins decoded chunks into the dictation's text. The first text is
-    /// kept exactly as decoded, so a dictation with no cut reads like the
-    /// batch path's; a later chunk may lose a repeated opening phrase.
+    /// Joins decoded chunks into the dictation's text: each chunk's batch
+    /// decode, in order, as decoded. The one exception is a chunk that
+    /// follows a forced cut, which can split a sentence (see
+    /// droppingRepeatedLead). After a pause, a chunk starts a new phrase,
+    /// and repeating words is ordinary speech ("I think we should, I think
+    /// we should go"; "see you on the call. On the call we will review"),
+    /// so it is kept as the batch decode keeps it. The first text is never
+    /// trimmed, so a dictation with no cut reads exactly like today's.
     static func joinChunks(_ chunks: [(text: String, followsForcedCut: Bool)]) -> String {
         var result = ""
         for chunk in chunks where !chunk.text.isEmpty {
-            let text = result.isEmpty
-                ? chunk.text
-                : droppingRepeatedLead(of: chunk.text, after: result, acrossJoin: chunk.followsForcedCut)
+            let text = !result.isEmpty && chunk.followsForcedCut
+                ? droppingRepeatedLead(of: chunk.text, after: result)
+                : chunk.text
             result = join([result, text])
         }
         return result
@@ -47,14 +52,10 @@ enum LiveText {
 
     /// Whisper, prompted with the text so far, sometimes opens a chunk that
     /// starts mid-sentence by repeating a phrase: its own first three or more
-    /// words, or, with `acrossJoin`, two or more of the last words before the
-    /// join. Chunks never share audio, so such a repeat is dropped. Only a
-    /// forced cut can split a sentence; after a pause, repeating the words
-    /// before it is ordinary speech ("see you on the call. On the call we
-    /// will review"), so callers pass `acrossJoin` only for forced cuts.
-    /// Short repeats are kept, since speech has those ("that that", "two
-    /// words, two words", "谢谢").
-    static func droppingRepeatedLead(of text: String, after previous: String, acrossJoin: Bool) -> String {
+    /// words, or two or more of the last words before the cut. Chunks never
+    /// share audio, so such a repeat is dropped. Short repeats are kept,
+    /// since speech has those ("that that", "two words, two words", "谢谢").
+    static func droppingRepeatedLead(of text: String, after previous: String) -> String {
         let words = words(in: text)
         let earlier = Array(Self.words(in: previous).suffix(8))
         func isPhrase(_ phrase: ArraySlice<LiveWord>) -> Bool {
@@ -69,7 +70,7 @@ enum LiveText {
             repeated = length
             break
         }
-        if repeated == 0 && acrossJoin {
+        if repeated == 0 {
             for length in stride(from: min(8, words.count, earlier.count), through: 2, by: -1)
             where isPhrase(words[0..<length]) && same(words[0..<length], earlier.suffix(length)[...]) {
                 repeated = length

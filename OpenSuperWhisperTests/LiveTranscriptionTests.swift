@@ -159,10 +159,17 @@ final class LiveTextJoinTests: XCTestCase {
     func testTheFirstChunkIsKeptExactlyAsDecoded() {
         // A dictation with no cut must read exactly like the batch path's.
         XCTAssertEqual(LiveText.joinChunks([(" I want to I want to go home", false)]), " I want to I want to go home")
-        XCTAssertEqual(LiveText.joinChunks([("", false), (" I want to I want to go home", false)]), " I want to I want to go home",
-                       "The first chunk with text counts as the first")
+        XCTAssertEqual(LiveText.joinChunks([("", false), (" I want to I want to go home", true)]), " I want to I want to go home",
+                       "The first chunk with text counts as the first, even after a forced cut")
         XCTAssertEqual(LiveTranscript(chunks: [LiveTranscript.Chunk(samples: 0..<16_000, text: " I want to I want to go home")]).text,
                        " I want to I want to go home")
+    }
+
+    func testAPauseCutKeepsARestartThatRepeatsItsOpeningPhrase() {
+        XCTAssertEqual(
+            LiveText.joinChunks([(" Before the pause.", false), (" I think we should, I think we should go.", false)]),
+            " Before the pause. I think we should, I think we should go."
+        )
     }
 
     func testAPauseCutKeepsWordsThatRepeatTheChunkBefore() {
