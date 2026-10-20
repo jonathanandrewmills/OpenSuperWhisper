@@ -95,6 +95,12 @@ class SettingsViewModel: ObservableObject {
             AppPreferences.shared.showTimestamps = showTimestamps
         }
     }
+
+    @Published var liveTranscription: Bool {
+        didSet {
+            AppPreferences.shared.liveTranscription = liveTranscription
+        }
+    }
     
     @Published var temperature: Double {
         didSet {
@@ -214,6 +220,7 @@ class SettingsViewModel: ObservableObject {
         self.selectedLanguage = prefs.whisperLanguage
         self.suppressBlankAudio = prefs.suppressBlankAudio
         self.showTimestamps = prefs.showTimestamps
+        self.liveTranscription = prefs.liveTranscription
         self.temperature = prefs.temperature
         self.noSpeechThreshold = prefs.noSpeechThreshold
         self.initialPrompt = prefs.initialPrompt
@@ -935,6 +942,24 @@ struct SettingsView: View {
                             Toggle("", isOn: $viewModel.showTimestamps)
                                 .toggleStyle(SwitchToggleStyle(tint: Color.accentColor))
                                 .labelsHidden()
+                        }
+
+                        if viewModel.selectedEngine == "whisper" {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Live Transcription")
+                                        .font(.subheadline)
+                                    Text(viewModel.showTimestamps
+                                         ? "Not used while Show Timestamps is on"
+                                         : "Transcribes while you speak, so long dictations paste sooner. Uses the GPU while recording")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Toggle("", isOn: $viewModel.liveTranscription)
+                                    .toggleStyle(SwitchToggleStyle(tint: Color.accentColor))
+                                    .labelsHidden()
+                            }
                         }
                         
                         HStack {

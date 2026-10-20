@@ -72,6 +72,50 @@ final class PCMRecordingTests: XCTestCase {
         }
     }
 
+    func testLiveBlocksMatchTheRecordedSamples() throws {
+        for (rate, channelCount) in [(16000.0, 1), (44100.0, 1), (48000.0, 1), (48000.0, 2), (48000.0, 4)] {
+            for chunkSize in [1, 17, 333, 1024, 4096, 8192] {
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("pcm-live-\(UUID()).wav")
+                defer { try? FileManager.default.removeItem(at: url) }
+                let layout = try XCTUnwrap(AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channelCount)))
+                let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,
+                                                        interleaved: false, channelLayout: layout))
+                let writer = try PCMRecordingWriter(url: url, inputFormat: format)
+                var live: [Float] = []
+                writer.onMonoBlock = { live.append(contentsOf: $0) }
+                let frameCount = Int(rate * 2.5)
+                var offset = 0
+                while offset < frameCount {
+                    let count = min(chunkSize, frameCount - offset)
+                    let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)))
+                    buffer.frameLength = AVAudioFrameCount(count)
+                    for channel in 0..<channelCount {
+                        for frame in 0..<count {
+                            let time = Double(offset + frame) / rate
+                            // Extra channels start halfway, as an interface whose
+                            // second input is plugged in during the recording.
+                            let amplitude = channel == 0 || time > 1.25 ? 0.2 : 0.0
+                            buffer.floatChannelData![channel][frame] = Float(amplitude * sin(time * Double(300 + channel * 137) * 2 * .pi))
+                        }
+                    }
+                    try writer.append(buffer)
+                    offset += count
+                }
+                let recorded = try writer.finish().samples
+                XCTAssertEqual(live.count, recorded.count, "rate=\(rate), channels=\(channelCount), chunk=\(chunkSize)")
+                let difference = zip(live, recorded).map { abs($0 - $1) }.max() ?? 0
+                if channelCount == 1 {
+                    XCTAssertEqual(difference, 0, "rate=\(rate), chunk=\(chunkSize)")
+                } else {
+                    // Blocks pick active channels per block, the saved mix per
+                    // larger chunk, so they differ only while a channel is silent.
+                    print("[PCM-LIVE] channels=\(channelCount) chunk=\(chunkSize) largest difference=\(difference)")
+                    XCTAssertLessThanOrEqual(difference, 0.2)
+                }
+            }
+        }
+    }
+
     @MainActor
     func testServiceDecodesPreparedAudioWithoutReadingTheFile() async throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()

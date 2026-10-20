@@ -40,6 +40,9 @@ class TranscriptionService: ObservableObject {
     }
 
     private var recordingPreparation: RecordingPreparation?
+    /// Transcribes the current recording while it is made. Its text is used
+    /// when that recording's URL is transcribed.
+    private var liveTranscriber: LiveTranscriber?
     private var backgroundOperations: [UUID: Task<Void, Never>] = [:]
     private var shutdownTask: Task<Void, Never>?
     private var shutdownEngines: [WhisperEngine] = []
@@ -56,10 +59,16 @@ class TranscriptionService: ObservableObject {
         let engine = currentEngine
         let preparation = recordingPreparation
         let activeTask = transcriptionTask
+        let live = liveTranscriber
+        liveTranscriber = nil
+        live?.cancel()
         let operations = Array(backgroundOperations.values)
         let task = Task {
             _ = await activeTask?.task.result
             _ = await preparation?.task.result
+            // A live pass may still be running natively; its state must be
+            // freed before the model it decodes with.
+            await live?.waitUntilIdle()
             for operation in operations {
                 await operation.value
             }
@@ -82,9 +91,20 @@ class TranscriptionService: ObservableObject {
         await task.value
     }
 
-    func prepareForRecording() {
-        guard !isShuttingDown, !isLoading, transcriptionTask == nil, recordingPreparation == nil,
-              let engine = currentEngine as? WhisperEngine else { return }
+    /// Called when recording starts. With live audio, the recording is
+    /// transcribed while it is made; otherwise a decoding state is prepared so
+    /// the decode after release does not pay for it.
+    func prepareForRecording(liveAudio: LiveAudioBuffer? = nil) {
+        guard !isShuttingDown, !isLoading, transcriptionTask == nil,
+              let engine = currentEngine as? WhisperEngine else {
+            liveAudio?.cancel()
+            return
+        }
+        if let liveAudio {
+            if startLiveTranscription(audio: liveAudio, engine: engine) { return }
+            liveAudio.cancel()
+        }
+        guard recordingPreparation == nil else { return }
         let task = Task.detached(priority: .userInitiated) {
             try engine.prepareForRecording()
         }
@@ -94,6 +114,30 @@ class TranscriptionService: ObservableObject {
             _ = await task.result
             self?.backgroundOperations[id] = nil
         }
+    }
+
+    private func startLiveTranscription(audio: LiveAudioBuffer, engine: WhisperEngine) -> Bool {
+        let settings = Settings()
+        guard !settings.showTimestamps else { return false }
+        // Only one recording is made at a time; a session nobody collected
+        // (its recording was queued instead) must not keep its state.
+        discardLiveTranscription()
+        let transcriber = LiveTranscriber(
+            audio: audio,
+            makeDecoder: { try engine.makeLiveDecoder(settings: settings) },
+            makeProbe: { try WhisperSpeechProbe() }
+        )
+        liveTranscriber = transcriber
+        transcriber.start()
+        return true
+    }
+
+    /// Drops the live session (only the one for `url`, when given); its
+    /// recording, if kept, is decoded whole.
+    func discardLiveTranscription(for url: URL? = nil) {
+        guard let liveTranscriber, url == nil || liveTranscriber.recordingURL == url else { return }
+        liveTranscriber.cancel()
+        self.liveTranscriber = nil
     }
     
     struct EngineSelection: Equatable {
@@ -173,6 +217,7 @@ class TranscriptionService: ObservableObject {
         engineLoadID = id
         currentEngine = nil
         recordingPreparation = nil
+        discardLiveTranscription()
         loadingError = nil
         isLoading = true
         let loader = engineLoader
@@ -279,6 +324,10 @@ class TranscriptionService: ObservableObject {
 
         let preparation = recordingPreparation
         recordingPreparation = nil
+        let live = liveTranscriber?.recordingURL == url ? liveTranscriber : nil
+        if live != nil {
+            liveTranscriber = nil
+        }
 
         // Setup progress callback for engines
         if let whisperEngine = engine as? WhisperEngine {
@@ -318,7 +367,11 @@ class TranscriptionService: ObservableObject {
             
             let result: String
             do {
-                if let pcmSamples, let whisper = engine as? WhisperEngine {
+                if let live {
+                    result = try await Self.finishLiveTranscription(
+                        live, engine: engine, url: url, settings: settings, pcmSamples: pcmSamples
+                    )
+                } else if let pcmSamples, let whisper = engine as? WhisperEngine {
                     result = try await whisper.transcribeSamples(pcmSamples, settings: settings)
                 } else {
                     result = try await engine.transcribeAudio(url: url, settings: settings)
@@ -391,6 +444,29 @@ class TranscriptionService: ObservableObject {
             return try await task.value
         } catch is CancellationError {
             throw CancellationError()
+        }
+    }
+
+    /// The live session has decoded every chunk but the last; this decodes
+    /// the last one and cleans the joined text once, as the batch path does.
+    /// If any pass failed, the whole recording is decoded the usual way.
+    private nonisolated static func finishLiveTranscription(
+        _ live: LiveTranscriber,
+        engine: TranscriptionEngine,
+        url: URL,
+        settings: Settings,
+        pcmSamples: [Float]?
+    ) async throws -> String {
+        do {
+            let transcript = try await live.finish()
+            return WhisperEngine.cleanedTranscript(transcript.text, settings: settings)
+        } catch {
+            try Task.checkCancellation()
+            print("Live transcription unavailable, decoding the whole recording: \(error)")
+            if let pcmSamples, let whisper = engine as? WhisperEngine {
+                return try await whisper.transcribeSamples(pcmSamples, settings: settings)
+            }
+            return try await engine.transcribeAudio(url: url, settings: settings)
         }
     }
 }

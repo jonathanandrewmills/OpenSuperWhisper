@@ -19,6 +19,8 @@ final class PCMRecordingWriter {
     private let converter: AVAudioConverter
     private let output: AVAudioPCMBuffer
     private var channels: [[Float]]
+    /// Receives every converted block mixed to mono, for live transcription.
+    var onMonoBlock: (([Float]) -> Void)?
 
     init(url: URL, inputFormat: AVAudioFormat) throws {
         self.url = url
@@ -88,6 +90,33 @@ final class PCMRecordingWriter {
                     channels[channel].append(Float(data[frame * count + channel]) / 32768)
                 }
             }
+            if let onMonoBlock {
+                onMonoBlock(Self.monoBlock(from: data, frames: Int(output.frameLength), channels: count))
+            }
+        }
+    }
+
+    /// One block mixed with the rule mixedSamples() applies per chunk: average
+    /// the channels that carry signal. For a mono input the blocks add up to
+    /// exactly the samples finish() returns.
+    private static func monoBlock(from data: UnsafePointer<Int16>, frames: Int, channels: Int) -> [Float] {
+        if channels == 1 {
+            return (0..<frames).map { Float(data[$0]) / 32768 }
+        }
+        let active = (0..<channels).filter { channel in
+            var energy: Float = 0
+            for frame in 0..<frames {
+                let sample = Float(data[frame * channels + channel]) / 32768
+                energy += sample * sample
+            }
+            return sqrtf(energy / Float(frames)) > 0.0001
+        }
+        let selected = active.isEmpty ? Array(0..<channels) : active
+        let normalization = 1 / Float(selected.count)
+        return (0..<frames).map { frame in
+            var sample: Float = 0
+            for channel in selected { sample += Float(data[frame * channels + channel]) / 32768 }
+            return sample * normalization
         }
     }
 
@@ -130,11 +159,12 @@ final class PCMRecordingSession {
     private var failure: Error?
     private let onFailure: (Error) -> Void
 
-    init(url: URL, onFailure: @escaping (Error) -> Void = { _ in }) throws {
+    init(url: URL, onMonoBlock: (([Float]) -> Void)? = nil, onFailure: @escaping (Error) -> Void = { _ in }) throws {
         self.onFailure = onFailure
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         writer = try PCMRecordingWriter(url: url, inputFormat: format)
+        writer.onMonoBlock = onMonoBlock
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else {

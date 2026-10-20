@@ -111,6 +111,15 @@ final class AppPreferences {
     
     @UserDefault(key: "showTimestamps", defaultValue: false)
     var showTimestamps: Bool
+
+    @UserDefault(key: "liveTranscription", defaultValue: false)
+    var liveTranscription: Bool
+
+    /// Live transcription is Whisper only, and stands down while timestamps
+    /// are shown: they refer to positions in the whole recording.
+    var isLiveTranscriptionActive: Bool {
+        liveTranscription && selectedEngine == "whisper" && !showTimestamps
+    }
     
     @UserDefault(key: "temperature", defaultValue: 0.0)
     var temperature: Double

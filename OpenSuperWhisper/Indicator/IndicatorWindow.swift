@@ -206,6 +206,7 @@ class IndicatorViewModel: ObservableObject {
                     self.recordingSessionID = nil
                 }
                 if let audio = await self.stopRecordingOperation() {
+                    self.transcriptionService.discardLiveTranscription(for: audio.url)
                     await self.transcriptionQueue.addFileToQueue(url: audio.url)
                 }
             }

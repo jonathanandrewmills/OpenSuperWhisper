@@ -21,8 +21,9 @@ private class ProgressContext {
     }
 }
 
-/// Thread-safe cancellation flag. Owned by the engine for its whole lifetime,
-/// so the pointer passed into whisper's C callback can never dangle.
+/// Thread-safe cancellation flag. Owned by the engine (or a live decoder) for
+/// its whole lifetime, so the pointer passed into whisper's C callback can
+/// never dangle.
 private final class AbortFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var _isSet = false
@@ -60,6 +61,7 @@ class WhisperEngine: TranscriptionEngine {
     fileprivate struct DecodedPass {
         var segments: [DecodedSegment] = []
         var segmentTexts: [String] = []
+        var tokens: [WhisperToken] = []
         var languageID = -1
     }
 
@@ -96,6 +98,14 @@ class WhisperEngine: TranscriptionEngine {
             }
             preparedState = state
         }
+    }
+
+    /// A decoder for live transcription with its own state on this model.
+    func makeLiveDecoder(settings: Settings) throws -> WhisperLiveDecoder {
+        guard let context else {
+            throw TranscriptionError.contextInitializationFailed
+        }
+        return try WhisperLiveDecoder(context: context, settings: settings)
     }
     
     private let modelPath: String?
@@ -228,8 +238,9 @@ class WhisperEngine: TranscriptionEngine {
     }
 
     /// One whisper_full call over 16 kHz audio: the Silero trim, the user's
-    /// decode settings and the native decode, on the state `makeState` gives.
-    /// Returns nil when Silero hears no speech.
+    /// decode settings and the native decode. The batch path and live chunk
+    /// passes both decode here, so a chunk is decoded exactly like a short
+    /// recording. Returns nil when Silero hears no speech.
     fileprivate static func decodePass(
         samples converted: [Float],
         settings: Settings,
@@ -337,6 +348,7 @@ class WhisperEngine: TranscriptionEngine {
                     endTimeCentiseconds: segmentEnd
                 )
             )
+            pass.tokens.append(contentsOf: state.segmentTextTokens(i))
             
             if settings.showTimestamps {
                 let t0 = state.segmentT0(i)
@@ -700,5 +712,110 @@ class WhisperEngine: TranscriptionEngine {
             interleaved: false,
             channelLayout: channelLayout
         )
+    }
+}
+
+/// Decodes live-transcription chunks on its own whisper_state, sharing the
+/// engine's loaded model. It has its own Silero context for the trim because
+/// the engine's may be in use by a file transcription at the same time.
+final class WhisperLiveDecoder: LiveDecoding {
+    private let context: MyWhisperContext
+    private let settings: Settings
+    private let abortFlag = AbortFlag()
+    private let initialPromptTokens: [WhisperToken]
+    private let carriesInitialPrompt: Bool
+    private let promptCapacity: Int
+
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var state: MyWhisperState?
+    private var vad: MyWhisperVadContext?
+
+    fileprivate init(context: MyWhisperContext, settings: Settings) throws {
+        guard let state = context.makeState(),
+              let path = WhisperEngine.vadModelPath,
+              let vad = MyWhisperVadContext(modelPath: path) else {
+            throw TranscriptionError.contextInitializationFailed
+        }
+        self.context = context
+        self.settings = settings
+        self.state = state
+        self.vad = vad
+        initialPromptTokens = settings.initialPrompt.isEmpty ? [] : context.tokens(text: settings.initialPrompt)
+        let params = WhisperEngine.makeFullParams(
+            settings: settings,
+            nThreads: 1,
+            modelTextContext: context.nTextCtx,
+            initialPromptTokenCount: initialPromptTokens.count
+        )
+        carriesInitialPrompt = params.carryInitialPrompt
+        promptCapacity = Int(params.nMaxTextCtx)
+    }
+
+    func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult {
+        let (state, vad) = try beginPass()
+        // Without earlier text the chunk is decoded exactly as the batch path
+        // decodes a recording, so a dictation with no cut gets today's text.
+        let prompt = history.isEmpty ? nil : LivePrompt.tokens(
+            initialPrompt: initialPromptTokens,
+            carriesInitialPrompt: carriesInitialPrompt,
+            history: history,
+            capacity: promptCapacity
+        )
+        guard let pass = try WhisperEngine.decodePass(
+            samples: samples,
+            settings: settings,
+            context: context,
+            vad: vad,
+            abortFlag: abortFlag,
+            progressContext: nil,
+            adjustParams: { params in
+                // The state is reused by every pass of the recording, so each
+                // pass starts from the prompt built here, not the last pass's.
+                params.noContext = true
+                if let prompt {
+                    params.promptTokens = prompt
+                    params.initialPrompt = nil
+                    params.carryInitialPrompt = false
+                }
+                if let language {
+                    params.language = language
+                }
+            },
+            makeState: { state }
+        ) else {
+            return LiveChunkResult(text: "", tokens: [], detectedLanguage: nil)
+        }
+        let detected = settings.selectedLanguage == "auto" && pass.languageID >= 0
+            ? MyWhisperContext.langStr(id: pass.languageID)
+            : nil
+        return LiveChunkResult(
+            text: WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false),
+            tokens: pass.tokens,
+            detectedLanguage: detected
+        )
+    }
+
+    private func beginPass() throws -> (MyWhisperState, MyWhisperVadContext) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isCancelled else { throw CancellationError() }
+        guard let state, let vad else { throw TranscriptionError.contextInitializationFailed }
+        abortFlag.isSet = false
+        return (state, vad)
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        abortFlag.isSet = true
+        lock.unlock()
+    }
+
+    func close() {
+        lock.lock()
+        state = nil
+        vad = nil
+        lock.unlock()
     }
 }

@@ -27,6 +27,9 @@ public struct WhisperVadSegment {
 }
 
 public class MyWhisperVadContext {
+    /// Silero at 16 kHz scores one probability per 512-sample (32 ms) frame.
+    public static let frameSampleCount = 512
+
     private var vctx: OpaquePointer?
     
     public init?(modelPath: String) {
@@ -40,6 +43,26 @@ public class MyWhisperVadContext {
         if let vctx = vctx {
             whisper_vad_free(vctx)
         }
+    }
+
+    /// Starts a new stream: the LSTM state buffer is not zeroed at load.
+    public func resetStreamingState() {
+        guard let vctx = vctx else { return }
+        whisper_vad_reset_state(vctx)
+    }
+
+    /// Scores whole frames while keeping Silero's LSTM state between calls,
+    /// so a recording can be probed block by block as it arrives. A partial
+    /// frame would be zero-padded and corrupt that state, so callers pass a
+    /// multiple of frameSampleCount.
+    public func streamingSpeechProbabilities(for samples: ArraySlice<Float>) -> [Float]? {
+        guard let vctx = vctx, !samples.isEmpty,
+              samples.count % Self.frameSampleCount == 0 else { return nil }
+        let detected = samples.withUnsafeBufferPointer { buffer in
+            whisper_vad_detect_speech_no_reset(vctx, buffer.baseAddress, Int32(buffer.count))
+        }
+        guard detected, let probs = whisper_vad_probs(vctx) else { return nil }
+        return Array(UnsafeBufferPointer(start: probs, count: Int(whisper_vad_n_probs(vctx))))
     }
     
     public func speechSegments(in samples: [Float]) -> [WhisperVadSegment]? {
@@ -102,6 +125,16 @@ public final class MyWhisperState {
 
     public func segmentT1(_ index: Int) -> Int64 {
         whisper_full_get_segment_t1_from_state(pointer, Int32(index))
+    }
+
+    /// Text tokens of a segment, without timestamps or other special tokens,
+    /// in the form whisper.cpp itself carries into later prompts.
+    public func segmentTextTokens(_ index: Int) -> [WhisperToken] {
+        let eot = context.tokenEot
+        let count = Int(whisper_full_n_tokens_from_state(pointer, Int32(index)))
+        return (0..<count)
+            .map { whisper_full_get_token_id_from_state(pointer, Int32(index), Int32($0)) }
+            .filter { $0 < eot }
     }
 }
 
@@ -269,6 +302,14 @@ public class MyWhisperContext {
     public func tokenCount(text: String) -> Int {
         guard let ctx = ctx else { return 0 }
         return Int(text.withCString { whisper_token_count(ctx, $0) })
+    }
+
+    public func tokens(text: String) -> [WhisperToken] {
+        let count = tokenCount(text: text)
+        guard count > 0 else { return [] }
+        var tokens = [WhisperToken](repeating: 0, count: count)
+        let written = tokenize(text: text, tokens: &tokens, nMaxTokens: count)
+        return written > 0 ? Array(tokens.prefix(written)) : []
     }
     
     // MARK: - Language Handling

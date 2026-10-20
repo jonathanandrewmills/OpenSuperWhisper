@@ -23,6 +23,8 @@ class AudioRecorder: NSObject, ObservableObject {
     private let workQueue = DispatchQueue(label: "com.opensuperwhisper.audiorecorder")
     
     private var recordingSession: PCMRecordingSession?
+    /// The recording's audio as live transcription reads it, when enabled.
+    private var liveAudio: LiveAudioBuffer?
     private var audioPlayer: AVAudioPlayer?
     private var notificationSound: NSSound?
     private let temporaryDirectory: URL
@@ -185,8 +187,16 @@ class AudioRecorder: NSObject, ObservableObject {
         }
         #endif
         
+        // Live transcription reads the same converted audio the WAV gets, so
+        // it hears exactly what is saved, with no second audio engine.
+        let liveAudio = AppPreferences.shared.isLiveTranscriptionActive
+            ? LiveAudioBuffer(recordingURL: fileURL)
+            : nil
         do {
-            let session = try PCMRecordingSession(url: fileURL) { [weak self] error in
+            let session = try PCMRecordingSession(
+                url: fileURL,
+                onMonoBlock: liveAudio.map { buffer in { buffer.append($0) } }
+            ) { [weak self] error in
                 self?.workQueue.async {
                     guard let self, self.currentRecordingURL == fileURL else { return }
                     _ = self.performStop(discard: false)
@@ -194,9 +204,10 @@ class AudioRecorder: NSObject, ObservableObject {
                 }
             }
             recordingSession = session
+            self.liveAudio = liveAudio
             try session.start()
             Task { @MainActor in
-                TranscriptionService.shared.prepareForRecording()
+                TranscriptionService.shared.prepareForRecording(liveAudio: liveAudio)
             }
             if monitorConnection {
                 startConnectionMonitoring()
@@ -207,6 +218,8 @@ class AudioRecorder: NSObject, ObservableObject {
         } catch {
             print("Failed to start recording: \(error)")
             recordingSession = nil
+            liveAudio?.cancel()
+            self.liveAudio = nil
             currentRecordingURL = nil
             restoreSystemDefaultInputIfNeeded()
             failStart(sessionID: sessionID, message: error.localizedDescription)
@@ -232,7 +245,9 @@ class AudioRecorder: NSObject, ObservableObject {
                 // Detach the session immediately (UI state, connection monitoring),
                 // then keep capturing a short tail before actually stopping, so the
                 // end of the last word released together with the hotkey survives.
+                let liveAudio = self.liveAudio
                 self.recordingSession = nil
+                self.liveAudio = nil
                 self.currentRecordingURL = nil
                 self.stopConnectionMonitoring()
                 self.updateRecordingState(isRecording: false, isConnecting: false)
@@ -241,6 +256,7 @@ class AudioRecorder: NSObject, ObservableObject {
                     let recording: RecordedAudio?
                     do { recording = try recorder.finish() }
                     catch {
+                        liveAudio?.cancel()
                         self.preserveCaptureFailure(error)
                         self.restoreSystemDefaultInputIfNeeded()
                         continuation.resume(returning: nil)
@@ -253,8 +269,10 @@ class AudioRecorder: NSObject, ObservableObject {
                     }
                     
                     if let recording, recording.duration >= Self.minimumRecordingDuration {
+                        liveAudio?.finish()
                         continuation.resume(returning: recording)
                     } else {
+                        liveAudio?.cancel()
                         try? FileManager.default.removeItem(at: url)
                         continuation.resume(returning: nil)
                     }
@@ -284,6 +302,10 @@ class AudioRecorder: NSObject, ObservableObject {
             }
         }
         recordingSession = nil
+        // Nobody asks a stopped-here recording for live text: a discard has no
+        // text, and a capture failure is decoded whole if it is kept.
+        liveAudio?.cancel()
+        liveAudio = nil
         stopConnectionMonitoring()
         restoreSystemDefaultInputIfNeeded()
         updateRecordingState(isRecording: false, isConnecting: false)
