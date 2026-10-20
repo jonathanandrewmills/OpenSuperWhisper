@@ -288,7 +288,7 @@ final class LivePreviewSchedulingTests: XCTestCase {
 
         let release = ContinuousClock.now
         let transcript = try await transcriber.finish()
-        XCTAssertLessThan(release.duration(to: .now), .seconds(1))
+        XCTAssertLessThan(release.duration(to: .now), .seconds(10), "Release does not wait out the 60 s preview budget")
         XCTAssertEqual(decoder.abortCount, 1)
         XCTAssertEqual(transcript.text, " chunk0.")
     }
@@ -334,20 +334,20 @@ final class LivePreviewServiceTests: XCTestCase {
         service.prepareForRecording(liveAudio: buffer)
         let send = try XCTUnwrap(onPreview())
 
-        var published: [LivePreview?] = []
-        let subscription = service.$livePreview.dropFirst().sink { published.append($0) }
+        var published: [(preview: LivePreview?, at: ContinuousClock.Instant)] = []
+        let subscription = service.$livePreview.dropFirst().sink { published.append(($0, .now)) }
         defer { subscription.cancel() }
         send(LivePreview(settled: " word1", unsettled: ""))
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(published, [LivePreview(settled: " word1", unsettled: "")])
+        try await waitUntil("the first preview is published") { published.count == 1 }
 
         for index in 2...10 {
             send(LivePreview(settled: " word\(index)", unsettled: ""))
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(published.count, 1, "Within 200 ms of a change the indicator waits")
-        try await Task.sleep(nanoseconds: 300_000_000)
-        XCTAssertEqual(published, [LivePreview(settled: " word1", unsettled: ""), LivePreview(settled: " word10", unsettled: "")])
+        try await waitUntil("the burst is published") { published.count == 2 }
+        XCTAssertEqual(published.map(\.preview), [LivePreview(settled: " word1", unsettled: ""), LivePreview(settled: " word10", unsettled: "")],
+                       "A burst of previews is coalesced into its newest one")
+        XCTAssertGreaterThanOrEqual(published[0].at.duration(to: published[1].at), .milliseconds(200),
+                                    "The indicator changes at most five times a second")
 
         buffer.append(Array(repeating: 0.5, count: 2 * 16_000))
         buffer.finish()
@@ -356,22 +356,34 @@ final class LivePreviewServiceTests: XCTestCase {
         XCTAssertNil(service.livePreview, "The preview ends with its dictation")
 
         send(LivePreview(settled: " late", unsettled: ""))
-        try await Task.sleep(nanoseconds: 300_000_000)
+        // A late preview would be published within the 200 ms throttle; on a
+        // slow machine this check can only pass early, never fail falsely.
+        try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertNil(service.livePreview, "A finished session's preview is ignored")
+    }
+
+    /// Polls until `condition` holds, failing after a generous deadline:
+    /// fixed sleeps would race a loaded machine.
+    private func waitUntil(_ what: String, timeout: Duration = .seconds(5), _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out waiting until \(what)")
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 
     /// Starts a live session for a recording at `url` and shows one preview.
     private func startDictation(_ service: TranscriptionService, url: URL, onPreview: () -> ((LivePreview) -> Void)?) async throws {
         service.prepareForRecording(liveAudio: LiveAudioBuffer(recordingURL: url))
         try XCTUnwrap(onPreview())(LivePreview(settled: " discarded words", unsettled: ""))
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertNotNil(service.livePreview)
+        try await waitUntil("the preview is shown") { service.livePreview != nil }
     }
 
     private func waitUntilDropped(_ decoder: FakeLiveDecoder, _ service: TranscriptionService) async throws {
-        for _ in 0..<100 where !(decoder.isClosed && service.livePreview == nil) {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await waitUntil("the live session is dropped") { decoder.isClosed && service.livePreview == nil }
     }
 
     func testARecordingTooShortToKeepDropsItsLiveSession() async throws {
@@ -443,7 +455,7 @@ final class LivePreviewServiceTests: XCTestCase {
         }
 
         try XCTUnwrap(onPreview())(LivePreview(settled: " Hello", unsettled: " there"))
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await waitUntil("the indicator shows the preview") { viewModel.liveText != nil }
         XCTAssertEqual(viewModel.liveText, LivePreview(settled: "Hello", unsettled: " there"))
 
         let compact = IndicatorViewModel(transcriptionService: service, stopRecording: { nil }, cancelAudioRecording: {}, usesLiveLayout: false)
