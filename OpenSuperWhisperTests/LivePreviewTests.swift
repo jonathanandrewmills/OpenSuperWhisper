@@ -411,6 +411,43 @@ final class LivePreviewServiceTests: XCTestCase {
         XCTAssertNil(service.livePreview)
     }
 
+    func testEscRightAfterReleaseStopsTheLiveSessionsRunningPass() async throws {
+        let decoder = FakeLiveDecoder()
+        decoder.hold(pass: 0)
+        defer { decoder.release(pass: 0) }
+        let (service, _) = makeService(decoder)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("release-esc-\(UUID()).wav")
+        let buffer = LiveAudioBuffer(recordingURL: url)
+        service.prepareForRecording(liveAudio: buffer)
+
+        // 10 s of speech and a pause cut a chunk, whose pass is still running
+        // when the hotkey is released.
+        let speech = Array(repeating: Float(0.5), count: 10 * 16_000)
+        let samples = speech + Array(repeating: 0, count: 16_000) + speech.prefix(5 * 16_000)
+        for start in stride(from: 0, to: samples.count, by: 320) {
+            buffer.append(Array(samples[start..<min(start + 320, samples.count)]))
+        }
+        await decoder.waitUntilStarted(pass: 0)
+        buffer.finish()
+
+        // Esc arrives right after the decode starts, before it reaches the
+        // live session: this runs once transcribeAudio first suspends.
+        let escape = service.$isTranscribing.filter { $0 }.first().sink { _ in
+            DispatchQueue.main.async { service.cancelTranscription() }
+        }
+        defer { escape.cancel() }
+        do {
+            _ = try await service.transcribeAudio(url: url, settings: Settings(), pcmSamples: nil)
+            XCTFail("A cancelled dictation returned text")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertTrue(decoder.isCancelled, "The running chunk pass is aborted")
+        XCTAssertTrue(decoder.isClosed, "Its whisper state is freed before the decode task ends")
+        XCTAssertFalse(service.isTranscribing)
+    }
+
     func testTheLiveIndicatorShowsTheFittedPreview() async throws {
         let decoder = FakeLiveDecoder()
         let (service, onPreview) = makeService(decoder)

@@ -397,20 +397,28 @@ class TranscriptionService: ObservableObject {
         }
         
         let task = Task.detached(priority: .userInitiated) { [weak self] in
-            if let preparation, preparation.engine === engine {
-                try await preparation.task.value
+            do {
+                if let preparation, preparation.engine === engine {
+                    try await preparation.task.value
+                }
+                try Task.checkCancellation()
+
+                let cancelled = await MainActor.run {
+                    guard let self = self else { return true }
+                    return self.cancellationRequestedFor == operationID
+                }
+
+                guard !cancelled else {
+                    throw CancellationError()
+                }
+            } catch {
+                if let live {
+                    live.cancel()
+                    await live.waitUntilIdle()
+                }
+                throw error
             }
-            try Task.checkCancellation()
-            
-            let cancelled = await MainActor.run {
-                guard let self = self else { return true }
-                return self.cancellationRequestedFor == operationID
-            }
-            
-            guard !cancelled else {
-                throw CancellationError()
-            }
-            
+
             let result: String
             do {
                 if let live {
