@@ -253,4 +253,61 @@ final class LiveTranscriptionModelTests: XCTestCase {
             print("[LIVE-BENCH] model=\(URL(fileURLWithPath: modelPath).lastPathComponent) run=\(run.name) seconds=\(run.samples.count / Self.sampleRate) chunks=\(transcript.chunks.count) batchDecode=\(batchTime) liveAfterRelease=\(releaseTime)")
         }
     }
+
+    /// The same real-time playback with preview passes on, as the indicator
+    /// sees it: when the first words appear, how often they change, and the
+    /// wait after release while previews share the GPU with chunk passes.
+    func testRealTimePreviews() async throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["OSW_TEST_LIVE_BENCH"] == "1", "Set OSW_TEST_LIVE_BENCH=1")
+        let modelPath = try longFormModel()
+        let engine = try await loadEngine(modelPath)
+        let english = try samples(of: "long_en")
+        let runs: [(name: String, language: String, samples: [Float])] = [
+            ("en-30s", "en", Array(english.prefix(30 * Self.sampleRate))),
+            ("long_en", "en", english),
+            ("long_ru", "ru", try samples(of: "long_ru")),
+        ]
+        for run in runs {
+            let settings = settings(language: run.language, beamSearch: true)
+            let clock = ContinuousClock()
+            let start = clock.now
+            let lock = NSLock()
+            var updates: [Duration] = []
+            let buffer = LiveAudioBuffer(recordingURL: URL(fileURLWithPath: "/tmp/osw-live-bench-\(UUID().uuidString).wav"))
+            let transcriber = LiveTranscriber(
+                audio: buffer,
+                makeDecoder: { try engine.makeLiveDecoder(settings: settings) },
+                makeProbe: { try WhisperSpeechProbe() },
+                onPreview: { preview in
+                    guard !preview.isEmpty else { return }
+                    lock.withLock { updates.append(start.duration(to: clock.now)) }
+                }
+            )
+            transcriber.start()
+            for (index, blockStart) in stride(from: 0, to: run.samples.count, by: 320).enumerated() {
+                try await clock.sleep(until: start + .milliseconds(20 * (index + 1)))
+                buffer.append(Array(run.samples[blockStart..<min(blockStart + 320, run.samples.count)]))
+            }
+            buffer.finish()
+            let releaseStart = clock.now
+            let transcript = try await transcriber.finish()
+            let releaseTime = releaseStart.duration(to: clock.now)
+
+            let releaseOffset = start.duration(to: releaseStart)
+            let times = lock.withLock { updates }.filter { $0 <= releaseOffset }
+            let gaps = zip(times, times.dropFirst()).map { $1 - $0 }.sorted()
+            let speechStart = (try? firstSpeech(in: run.samples)) ?? .zero
+            print("[LIVE-PREVIEW-BENCH] model=\(URL(fileURLWithPath: modelPath).lastPathComponent) run=\(run.name) chunks=\(transcript.chunks.count) speechStart=\(speechStart) firstText=\(times.first ?? .zero) updates=\(times.count) medianGap=\(gaps.isEmpty ? .zero : gaps[gaps.count / 2]) maxGap=\(gaps.last ?? .zero) liveAfterRelease=\(releaseTime)")
+        }
+    }
+
+    /// When Silero first hears speech, for measuring first text from it.
+    private func firstSpeech(in samples: [Float]) throws -> Duration {
+        let probe = try WhisperSpeechProbe()
+        let frame = MyWhisperVadContext.frameSampleCount
+        let frames = min(samples.count / frame, 10 * Self.sampleRate / frame)
+        let probabilities = probe.probabilities(for: samples[0..<frames * frame]) ?? []
+        let index = probabilities.firstIndex { $0 >= 0.5 } ?? 0
+        return .milliseconds(index * frame * 1000 / Self.sampleRate)
+    }
 }

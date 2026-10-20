@@ -245,6 +245,17 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
     private(set) var isClosed = false
     var failingPass: Int?
     var detectedLanguage: String?
+    /// Preview passes return these in turn, then repeat the last one.
+    var previewTexts: [String] = [" preview"]
+    /// A held preview pass blocks until it is aborted or cancelled.
+    var holdsPreviews = false
+    var onPreviewStart: ((Int) -> Void)?
+    private var previewCallsStorage = 0
+    private var abortCountStorage = 0
+    private var previewAbort: DispatchSemaphore?
+
+    var previewCalls: Int { lock.withLock { previewCallsStorage } }
+    var abortCount: Int { lock.withLock { abortCountStorage } }
 
     var calls: [Call] {
         lock.lock()
@@ -300,10 +311,38 @@ final class FakeLiveDecoder: LiveDecoding, @unchecked Sendable {
         )
     }
 
+    func decodePreview(_ samples: [Float], history: [WhisperToken], language: String?) throws -> String {
+        lock.lock()
+        let index = previewCallsStorage
+        previewCallsStorage += 1
+        let text = previewTexts[min(index, previewTexts.count - 1)]
+        let abort = holdsPreviews ? DispatchSemaphore(value: 0) : nil
+        previewAbort = abort
+        let onStart = onPreviewStart
+        lock.unlock()
+
+        onStart?(index)
+        if let abort {
+            abort.wait()
+            throw CancellationError()
+        }
+        if lock.withLock({ isCancelled }) { throw CancellationError() }
+        return text
+    }
+
+    func abortCurrentPass() {
+        lock.lock()
+        abortCountStorage += 1
+        let abort = previewAbort
+        previewAbort = nil
+        lock.unlock()
+        abort?.signal()
+    }
+
     func cancel() {
         lock.lock()
         isCancelled = true
-        let held = releaseSignals.values
+        let held = Array(releaseSignals.values) + [previewAbort].compactMap { $0 }
         lock.unlock()
         held.forEach { $0.signal() }
     }

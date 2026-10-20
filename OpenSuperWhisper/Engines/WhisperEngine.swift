@@ -753,6 +753,30 @@ final class WhisperLiveDecoder: LiveDecoding {
     }
 
     func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult {
+        guard let pass = try decode(samples, history: history, language: language, preview: false) else {
+            return LiveChunkResult(text: "", tokens: [], detectedLanguage: nil)
+        }
+        let detected = settings.selectedLanguage == "auto" && pass.languageID >= 0
+            ? MyWhisperContext.langStr(id: pass.languageID)
+            : nil
+        return LiveChunkResult(
+            text: WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false),
+            tokens: pass.tokens,
+            detectedLanguage: detected
+        )
+    }
+
+    func decodePreview(_ samples: [Float], history: [WhisperToken], language: String?) throws -> String {
+        guard let pass = try decode(samples, history: history, language: language, preview: true) else { return "" }
+        return WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false)
+    }
+
+    private func decode(
+        _ samples: [Float],
+        history: [WhisperToken],
+        language: String?,
+        preview: Bool
+    ) throws -> WhisperEngine.DecodedPass? {
         let (state, vad) = try beginPass()
         // Without earlier text the chunk is decoded exactly as the batch path
         // decodes a recording, so a dictation with no cut gets today's text.
@@ -762,7 +786,7 @@ final class WhisperLiveDecoder: LiveDecoding {
             history: history,
             capacity: promptCapacity
         )
-        guard let pass = try WhisperEngine.decodePass(
+        return try WhisperEngine.decodePass(
             samples: samples,
             settings: settings,
             context: context,
@@ -781,18 +805,17 @@ final class WhisperLiveDecoder: LiveDecoding {
                 if let language {
                     params.language = language
                 }
+                if preview {
+                    // Display only: one greedy candidate, and no temperature
+                    // fallback, whose retries cost seconds and buy nothing
+                    // when a word only counts once two passes agree.
+                    params.strategy = .greedy
+                    params.greedyBestOf = 1
+                    params.temperature = 0
+                    params.temperatureInc = 0
+                }
             },
             makeState: { state }
-        ) else {
-            return LiveChunkResult(text: "", tokens: [], detectedLanguage: nil)
-        }
-        let detected = settings.selectedLanguage == "auto" && pass.languageID >= 0
-            ? MyWhisperContext.langStr(id: pass.languageID)
-            : nil
-        return LiveChunkResult(
-            text: WhisperEngine.assembleSegmentTexts(pass.segmentTexts, showTimestamps: false),
-            tokens: pass.tokens,
-            detectedLanguage: detected
         )
     }
 
@@ -808,6 +831,12 @@ final class WhisperLiveDecoder: LiveDecoding {
     func cancel() {
         lock.lock()
         isCancelled = true
+        abortFlag.isSet = true
+        lock.unlock()
+    }
+
+    func abortCurrentPass() {
+        lock.lock()
         abortFlag.isSet = true
         lock.unlock()
     }

@@ -16,6 +16,8 @@ class TranscriptionService: ObservableObject {
     @Published private(set) var progress: Float = 0.0
     @Published private(set) var isConverting = false
     @Published private(set) var conversionProgress: Float = 0.0
+    /// Live text of the recording being made, for the recording indicator.
+    @Published private(set) var livePreview: LivePreview?
     
     private final class TranscriptionTaskBox {
         let id: UUID
@@ -43,6 +45,22 @@ class TranscriptionService: ObservableObject {
     /// Transcribes the current recording while it is made. Its text is used
     /// when that recording's URL is transcribed.
     private var liveTranscriber: LiveTranscriber?
+    /// The recording whose previews are shown; previews of any other are late.
+    private var livePreviewSource: URL?
+    private var pendingLivePreview: LivePreview?
+    private var livePreviewPublishedAt: ContinuousClock.Instant?
+    private var livePreviewFlush: Task<Void, Never>?
+    /// Re-rendering the indicator's material card costs main-thread time, so
+    /// its text changes at most five times a second.
+    static let livePreviewInterval: Duration = .milliseconds(200)
+    var makeLiveTranscriber: (LiveAudioBuffer, WhisperEngine, Settings, @escaping (LivePreview) -> Void) -> LiveTranscriber = { audio, engine, settings, onPreview in
+        LiveTranscriber(
+            audio: audio,
+            makeDecoder: { try engine.makeLiveDecoder(settings: settings) },
+            makeProbe: { try WhisperSpeechProbe() },
+            onPreview: onPreview
+        )
+    }
     private var backgroundOperations: [UUID: Task<Void, Never>] = [:]
     private var shutdownTask: Task<Void, Never>?
     private var shutdownEngines: [WhisperEngine] = []
@@ -62,6 +80,7 @@ class TranscriptionService: ObservableObject {
         let live = liveTranscriber
         liveTranscriber = nil
         live?.cancel()
+        endLivePreview()
         let operations = Array(backgroundOperations.values)
         let task = Task {
             _ = await activeTask?.task.result
@@ -122,14 +141,40 @@ class TranscriptionService: ObservableObject {
         // Only one recording is made at a time; a session nobody collected
         // (its recording was queued instead) must not keep its state.
         discardLiveTranscription()
-        let transcriber = LiveTranscriber(
-            audio: audio,
-            makeDecoder: { try engine.makeLiveDecoder(settings: settings) },
-            makeProbe: { try WhisperSpeechProbe() }
-        )
+        let source = audio.recordingURL
+        let transcriber = makeLiveTranscriber(audio, engine, settings) { [weak self] preview in
+            guard let self else { return }
+            Task { @MainActor in self.receiveLivePreview(preview, from: source) }
+        }
+        livePreviewSource = source
         liveTranscriber = transcriber
         transcriber.start()
         return true
+    }
+
+    private func receiveLivePreview(_ preview: LivePreview, from source: URL) {
+        guard livePreviewSource == source else { return }
+        pendingLivePreview = preview
+        guard livePreviewFlush == nil else { return }
+        let wait = livePreviewPublishedAt.map { Self.livePreviewInterval - $0.duration(to: .now) } ?? .zero
+        livePreviewFlush = Task { @MainActor [weak self] in
+            if wait > .zero { try? await Task.sleep(for: wait) }
+            guard let self, !Task.isCancelled else { return }
+            self.livePreviewFlush = nil
+            guard self.livePreviewSource == source, let pending = self.pendingLivePreview else { return }
+            self.pendingLivePreview = nil
+            self.livePreview = pending
+            self.livePreviewPublishedAt = .now
+        }
+    }
+
+    private func endLivePreview() {
+        livePreviewSource = nil
+        pendingLivePreview = nil
+        livePreviewFlush?.cancel()
+        livePreviewFlush = nil
+        livePreviewPublishedAt = nil
+        livePreview = nil
     }
 
     /// Drops the live session (only the one for `url`, when given); its
@@ -138,6 +183,7 @@ class TranscriptionService: ObservableObject {
         guard let liveTranscriber, url == nil || liveTranscriber.recordingURL == url else { return }
         liveTranscriber.cancel()
         self.liveTranscriber = nil
+        endLivePreview()
     }
     
     struct EngineSelection: Equatable {
@@ -426,6 +472,10 @@ class TranscriptionService: ObservableObject {
         transcriptionTask = taskBox
 
         defer {
+            // The indicator shows the live text until the dictation is done.
+            if let live, livePreviewSource == live.recordingURL {
+                endLivePreview()
+            }
             if transcriptionTask === taskBox {
                 let wasCancelled = cancellationRequestedFor == taskBox.id
                 transcriptionTask = nil

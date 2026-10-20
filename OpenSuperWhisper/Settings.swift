@@ -951,7 +951,7 @@ struct SettingsView: View {
                                         .font(.subheadline)
                                     Text(viewModel.showTimestamps
                                          ? "Not used while Show Timestamps is on"
-                                         : "Transcribes while you speak, so long dictations paste sooner. Uses the GPU while recording")
+                                         : "Transcribes while you speak, shows the words in the recording indicator, and pastes long dictations sooner. Uses the GPU while recording")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }

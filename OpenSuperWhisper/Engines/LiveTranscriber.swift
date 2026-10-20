@@ -25,6 +25,16 @@ struct LiveTranscriptionParameters {
     var probeBatchDuration: TimeInterval = 0.25
     /// Only the newest tokens can fit in a prompt.
     var historyTokenLimit = 448
+    /// Preview passes start about once a second, and no sooner than this
+    /// factor times the last pass's duration after the previous one started,
+    /// which leaves the GPU idle at least a fifth of the time.
+    var previewInterval: TimeInterval = 1
+    var previewSpacingFactor = 1.25
+    /// A preview pass running past the larger of these is aborted.
+    var previewBudgetMinimum: TimeInterval = 2
+    var previewBudgetFactor = 4.0
+    /// Less open audio than this has nothing worth showing.
+    var minimumPreviewDuration: TimeInterval = 0.5
 
     static let standard = LiveTranscriptionParameters()
 
@@ -226,6 +236,11 @@ struct LiveChunkResult {
 /// Decodes chunks with the user's batch settings. Passes are serial.
 protocol LiveDecoding: AnyObject {
     func decodeChunk(_ samples: [Float], history: [WhisperToken], language: String?) throws -> LiveChunkResult
+    /// A quick pass over the open chunk, for display only: greedy, at
+    /// temperature 0 and without fallback.
+    func decodePreview(_ samples: [Float], history: [WhisperToken], language: String?) throws -> String
+    /// Aborts the running pass only. Safe from any thread.
+    func abortCurrentPass()
     /// Aborts the running pass and every later one. Safe from any thread.
     func cancel()
     /// Frees native resources; called once no pass can run any more.
@@ -266,6 +281,15 @@ struct LiveTranscript {
     var text: String { LiveText.join(chunks.map(\.text)) }
 }
 
+/// What the indicator shows while recording: text that will not change
+/// any more within its chunk, then the words still changing.
+struct LivePreview: Equatable {
+    var settled: String
+    var unsettled: String
+
+    var isEmpty: Bool { settled.isEmpty && unsettled.isEmpty }
+}
+
 enum LiveTranscriptionError: Error {
     case audioNotFinished
     case probeFailed
@@ -274,7 +298,8 @@ enum LiveTranscriptionError: Error {
 /// Transcribes a recording while it is still being made. The audio is cut
 /// into chunks at natural pauses; each finished chunk is decoded right away
 /// with the earlier chunks' text as prompt, so at release only the last chunk
-/// is left to decode. All work runs on one serial queue, off the capture path.
+/// is left to decode. In between, preview passes over the open chunk feed
+/// `onPreview`. All work runs on one serial queue, off the capture path.
 final class LiveTranscriber: @unchecked Sendable {
     let recordingURL: URL
 
@@ -282,6 +307,8 @@ final class LiveTranscriber: @unchecked Sendable {
     private let parameters: LiveTranscriptionParameters
     private let makeDecoder: () throws -> LiveDecoding
     private let makeProbe: () throws -> SpeechProbing
+    private let onPreview: ((LivePreview) -> Void)?
+    private let now: () -> TimeInterval
     private let queue = DispatchQueue(label: "com.opensuperwhisper.live-transcription", qos: .userInitiated)
     private let frameSampleCount = MyWhisperVadContext.frameSampleCount
 
@@ -290,6 +317,9 @@ final class LiveTranscriber: @unchecked Sendable {
     private var cancelled = false
     private var processingScheduled = false
     private var activeDecoder: LiveDecoding?
+    private var finishRequested = false
+    private var runningPreview: Int?
+    private var previewCount = 0
 
     // Session queue only.
     private var decoder: LiveDecoding?
@@ -303,18 +333,31 @@ final class LiveTranscriber: @unchecked Sendable {
     private var language: String?
     private var failure: Error?
     private var isFinishing = false
+    private var agreement = LiveAgreement()
+    /// Settled preview words of chunks that are cut but not decoded yet.
+    private var pendingPreviewTexts: [String] = []
+    private var lastPreviewStart: TimeInterval?
+    private var lastPreviewDuration: TimeInterval = 0
+    private var previewDurations: [TimeInterval] = []
+    private var heardSpeechSincePreview = false
+    private var previewsStopped = false
+    private var lastPreview: LivePreview?
 
     init(
         audio: LiveAudioBuffer,
         parameters: LiveTranscriptionParameters = .standard,
         makeDecoder: @escaping () throws -> LiveDecoding,
-        makeProbe: @escaping () throws -> SpeechProbing
+        makeProbe: @escaping () throws -> SpeechProbing,
+        onPreview: ((LivePreview) -> Void)? = nil,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
     ) {
         self.audio = audio
         recordingURL = audio.recordingURL
         self.parameters = parameters
         self.makeDecoder = makeDecoder
         self.makeProbe = makeProbe
+        self.onPreview = onPreview
+        self.now = now
         cutter = ChunkCutter(parameters: parameters)
     }
 
@@ -351,7 +394,8 @@ final class LiveTranscriber: @unchecked Sendable {
     /// text. The audio must be finished. Throws when a pass failed, so the
     /// caller can decode the whole recording the usual way instead.
     func finish() async throws -> LiveTranscript {
-        try await withTaskCancellationHandler {
+        requestFinish()
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 queue.async {
                     continuation.resume(with: Result { try self.finishOnQueue() })
@@ -359,6 +403,18 @@ final class LiveTranscriber: @unchecked Sendable {
             }
         } onCancel: {
             cancel()
+        }
+    }
+
+    /// No preview starts after this, and a running one is aborted so the
+    /// release does not wait for it. The abort happens under the lock, so it
+    /// cannot reach a chunk pass that starts after the preview ends.
+    private func requestFinish() {
+        lock.lock()
+        defer { lock.unlock() }
+        finishRequested = true
+        if runningPreview != nil {
+            activeDecoder?.abortCurrentPass()
         }
     }
 
@@ -410,8 +466,15 @@ final class LiveTranscriber: @unchecked Sendable {
     private func process() {
         guard !isCancelled, failure == nil, !isFinishing, decoder != nil else { return }
         do {
-            try probeAudio(final: false)
-            try decodeCutChunks()
+            // A long chunk pass leaves a backlog: probe it, and decode what it
+            // cuts, before spending the GPU on a preview of stale audio.
+            var probed: Int
+            repeat {
+                probed = probedSamples
+                try probeAudio(final: false)
+                try decodeCutChunks()
+            } while probedSamples != probed
+            try previewIfDue()
         } catch {
             fail(error)
         }
@@ -428,19 +491,113 @@ final class LiveTranscriber: @unchecked Sendable {
             throw LiveTranscriptionError.probeFailed
         }
         probedSamples = range.upperBound
+        var cut = false
         for probability in probabilities {
+            heardSpeechSincePreview = heardSpeechSincePreview || probability >= parameters.speechThreshold
             if let cutFrame = cutter.append(probability) {
                 let cutSample = cutFrame * frameSampleCount
                 cutChunks.append(openChunkStart..<cutSample)
                 openChunkStart = cutSample
+                // The chunk keeps its settled words on screen until its own
+                // pass replaces them; what was still changing goes.
+                pendingPreviewTexts.append(agreement.settledText)
+                agreement = LiveAgreement()
+                cut = true
             }
         }
+        // More than one chunk waiting means passes are slower than speech:
+        // preview work is shed first, so every chunk is still decoded.
+        if cutChunks.count > 1 && !previewsStopped {
+            previewsStopped = true
+            print("[live] preview stopped for this recording: \(cutChunks.count) chunks waiting")
+        }
+        if cut { publishPreview() }
     }
 
     private func decodeCutChunks() throws {
         while !cutChunks.isEmpty {
             try decode(cutChunks.removeFirst())
+            // Its own text now replaces its preview words.
+            if !pendingPreviewTexts.isEmpty { pendingPreviewTexts.removeFirst() }
+            publishPreview()
         }
+    }
+
+    private func previewIfDue() throws {
+        guard onPreview != nil, !previewsStopped, cutChunks.isEmpty, heardSpeechSincePreview,
+              let decoder else { return }
+        let start = now()
+        if let lastPreviewStart,
+           start - lastPreviewStart < max(parameters.previewInterval, parameters.previewSpacingFactor * lastPreviewDuration) {
+            return
+        }
+        // Passes always take the newest audio.
+        let range = openChunkStart..<audio.count
+        guard Double(range.count) >= parameters.minimumPreviewDuration * Double(parameters.sampleRate),
+              let generation = beginPreview() else { return }
+        defer { endPreview() }
+        heardSpeechSincePreview = false
+        lastPreviewStart = start
+
+        let mean = previewDurations.isEmpty ? 0 : previewDurations.reduce(0, +) / Double(previewDurations.count)
+        let budget = max(parameters.previewBudgetMinimum, parameters.previewBudgetFactor * mean)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + budget) { [weak self] in
+            self?.abortPreview(generation, budget: budget)
+        }
+
+        let text: String
+        do {
+            text = try decoder.decodePreview(
+                audio.samples(in: range),
+                history: LiveText.capRepetitions(history),
+                language: language
+            )
+        } catch {
+            if isCancelled { throw CancellationError() }
+            // An aborted or failed preview costs only its display update.
+            lastPreviewDuration = now() - start
+            print(String(format: "[live] preview pass abandoned after %.2f s: %@", lastPreviewDuration, "\(error)"))
+            return
+        }
+        lastPreviewDuration = now() - start
+        previewDurations.append(lastPreviewDuration)
+        agreement.update(with: LiveText.cutRepetitionLoop(LiveText.words(in: text)))
+        publishPreview()
+    }
+
+    private func beginPreview() -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finishRequested, !cancelled else { return nil }
+        previewCount += 1
+        runningPreview = previewCount
+        return previewCount
+    }
+
+    /// Ends the preview under the lock, so a budget timer firing late can
+    /// never abort the pass that follows it.
+    private func endPreview() {
+        lock.lock()
+        runningPreview = nil
+        lock.unlock()
+    }
+
+    private func abortPreview(_ generation: Int, budget: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard runningPreview == generation else { return }
+        print(String(format: "[live] preview pass over its %.1f s budget, aborting", budget))
+        activeDecoder?.abortCurrentPass()
+    }
+
+    private func publishPreview() {
+        guard let onPreview else { return }
+        let settled = LiveText.join(chunks.map(\.text) + pendingPreviewTexts + [agreement.settledText])
+        let joined = LiveText.join([settled, agreement.unsettledText])
+        let preview = LivePreview(settled: settled, unsettled: String(joined.dropFirst(settled.count)))
+        guard preview != lastPreview else { return }
+        lastPreview = preview
+        onPreview(preview)
     }
 
     private func decode(_ range: Range<Int>) throws {
