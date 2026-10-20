@@ -56,6 +56,13 @@ class WhisperEngine: TranscriptionEngine {
         let segments: [DecodedSegment]
     }
 
+    /// Raw output of one whisper_full call, before any cleanup.
+    fileprivate struct DecodedPass {
+        var segments: [DecodedSegment] = []
+        var segmentTexts: [String] = []
+        var languageID = -1
+    }
+
     var engineName: String { "Whisper" }
     
     /// Silero VAD model shipped in the app bundle; always used to drop
@@ -65,6 +72,9 @@ class WhisperEngine: TranscriptionEngine {
     
     private var context: MyWhisperContext?
     private var vadContext: MyWhisperVadContext?
+    /// Created when recording starts, so the decode after release does not
+    /// pay for allocating it.
+    private var preparedState: MyWhisperState?
     private let abortFlag = AbortFlag()
     private var progressContext: ProgressContext?
     
@@ -74,14 +84,17 @@ class WhisperEngine: TranscriptionEngine {
         context != nil
     }
 
-    var hasPreparedState: Bool { context?.hasState == true }
+    var hasPreparedState: Bool { preparedState != nil }
 
     func prepareForRecording() throws {
         guard let context else {
             throw TranscriptionError.contextInitializationFailed
         }
-        if !context.hasState && !context.initState() {
-            throw TranscriptionError.contextInitializationFailed
+        if preparedState == nil {
+            guard let state = context.makeState() else {
+                throw TranscriptionError.contextInitializationFailed
+            }
+            preparedState = state
         }
     }
     
@@ -92,6 +105,7 @@ class WhisperEngine: TranscriptionEngine {
     }
 
     func unload() {
+        preparedState = nil
         context = nil
         vadContext = nil
     }
@@ -149,10 +163,10 @@ class WhisperEngine: TranscriptionEngine {
     ) async throws -> DetailedTranscription {
         try Task.checkCancellation()
 
-        guard let context = context else {
+        guard let context = context, let vadContext else {
             throw TranscriptionError.contextInitializationFailed
         }
-        defer { context.freeState() }
+        defer { preparedState = nil }
         
         abortFlag.isSet = false
         try Task.checkCancellation()
@@ -189,15 +203,54 @@ class WhisperEngine: TranscriptionEngine {
         
         try Task.checkCancellation()
         
+        // Fresh decoding state per recording: isolates prompt_past between
+        // recordings (a hallucination on silence cannot poison the next one).
+        guard let pass = try Self.decodePass(
+            samples: converted,
+            settings: settings,
+            context: context,
+            vad: vadContext,
+            abortFlag: abortFlag,
+            progressContext: progressContext,
+            makeState: {
+                try self.prepareForRecording()
+                return self.preparedState!
+            }
+        ) else {
+            return DetailedTranscription(text: "", segments: [])
+        }
+
+        let text = Self.cleanedTranscript(
+            Self.assembleSegmentTexts(pass.segmentTexts, showTimestamps: settings.showTimestamps),
+            settings: settings
+        )
+        return DetailedTranscription(text: text, segments: pass.segments)
+    }
+
+    /// One whisper_full call over 16 kHz audio: the Silero trim, the user's
+    /// decode settings and the native decode, on the state `makeState` gives.
+    /// Returns nil when Silero hears no speech.
+    fileprivate static func decodePass(
+        samples converted: [Float],
+        settings: Settings,
+        context: MyWhisperContext,
+        vad: MyWhisperVadContext,
+        abortFlag: AbortFlag,
+        progressContext: ProgressContext?,
+        adjustParams: (inout WhisperFullParams) -> Void = { _ in },
+        makeState: () throws -> MyWhisperState
+    ) throws -> DecodedPass? {
         // VAD gate: whisper never sees non-speech audio, so silence cannot
         // produce hallucinated text and long pauses are not decoded at all.
         // (whisper_full_with_state has no built-in VAD path — params.vad works
         // only through whisper_full, which would share decoding state.)
-        let speechSegments = try detectSpeech(in: converted)
+        guard let speechSegments = vad.speechSegments(in: converted) else {
+            throw TranscriptionError.processingFailed
+        }
         try Task.checkCancellation()
         if abortFlag.isSet { throw CancellationError() }
         if speechSegments.isEmpty {
-            return DetailedTranscription(text: "", segments: [])
+            return nil
         }
         // Timestamps of the trimmed audio would not match the original file,
         // so trimming is applied only when timestamps are not requested.
@@ -240,25 +293,24 @@ class WhisperEngine: TranscriptionEngine {
             }
         }
         
-        let progressContextPtr = Unmanaged.passUnretained(progressContext!).toOpaque()
-        params.progressCallback = progressCallback
-        params.progressCallbackUserData = progressContextPtr
+        if let progressContext {
+            params.progressCallback = progressCallback
+            params.progressCallbackUserData = Unmanaged.passUnretained(progressContext).toOpaque()
+        }
         
         if settings.useBeamSearch {
             params.beamSearchBeamSize = Int32(settings.beamSize)
         }
+        adjustParams(&params)
+
+        try Task.checkCancellation()
+        let state = try makeState()
         
         var cParams = params.toC()
         cParams.abort_callback = abortCallback
         cParams.abort_callback_user_data = Unmanaged.passUnretained(abortFlag).toOpaque()
         
-        try Task.checkCancellation()
-        
-        // Fresh decoding state per recording: isolates prompt_past between
-        // recordings (a hallucination on silence cannot poison the next one).
-        try prepareForRecording()
-        
-        guard context.full(samples: samples, params: &cParams) else {
+        guard context.full(samples: samples, params: &cParams, state: state) else {
             if abortFlag.isSet || Task.isCancelled {
                 throw CancellationError()
             }
@@ -267,20 +319,19 @@ class WhisperEngine: TranscriptionEngine {
         
         try Task.checkCancellation()
         
-        var segmentTexts: [String] = []
-        var decodedSegments: [DecodedSegment] = []
-        let nSegments = context.fullNSegments
-        segmentTexts.reserveCapacity(nSegments)
-        decodedSegments.reserveCapacity(nSegments)
+        var pass = DecodedPass()
+        let nSegments = state.segmentCount
+        pass.segmentTexts.reserveCapacity(nSegments)
+        pass.segments.reserveCapacity(nSegments)
         
         for i in 0..<nSegments {
             if i % 5 == 0 {
                 try Task.checkCancellation()
             }
             
-            guard let segmentText = context.fullGetSegmentText(iSegment: i) else { continue }
-            let segmentEnd = context.fullGetSegmentT1(iSegment: i)
-            decodedSegments.append(
+            guard let segmentText = state.segmentText(i) else { continue }
+            let segmentEnd = state.segmentT1(i)
+            pass.segments.append(
                 DecodedSegment(
                     text: segmentText,
                     endTimeCentiseconds: segmentEnd
@@ -288,33 +339,30 @@ class WhisperEngine: TranscriptionEngine {
             )
             
             if settings.showTimestamps {
-                let t0 = context.fullGetSegmentT0(iSegment: i)
-                segmentTexts.append(
+                let t0 = state.segmentT0(i)
+                pass.segmentTexts.append(
                     String(format: "[%.1f->%.1f] ", Float(t0) / 100.0, Float(segmentEnd) / 100.0)
                         + segmentText
                 )
             } else {
-                segmentTexts.append(segmentText)
+                pass.segmentTexts.append(segmentText)
             }
         }
+        pass.languageID = state.languageID
+        return pass
+    }
         
-        let cleanedText = Self.assembleSegmentTexts(
-            segmentTexts,
-            showTimestamps: settings.showTimestamps
-        )
+    /// The cleanup applied once to a whole dictation's text.
+    static func cleanedTranscript(_ text: String, settings: Settings) -> String {
+        let cleanedText = text
             .replacingOccurrences(of: "[MUSIC]", with: "")
             .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         
-        var processedText = cleanedText
         if settings.shouldApplyAsianAutocorrect && !cleanedText.isEmpty {
-            processedText = AutocorrectWrapper.format(cleanedText)
+            return AutocorrectWrapper.format(cleanedText)
         }
-        
-        return DetailedTranscription(
-            text: processedText,
-            segments: decodedSegments
-        )
+        return cleanedText
     }
 
     /// Whisper segments are decoder boundaries, not paragraph boundaries.
@@ -369,16 +417,6 @@ class WhisperEngine: TranscriptionEngine {
     }
     
     // MARK: - VAD
-    
-    private func detectSpeech(in samples: [Float]) throws -> [WhisperVadSegment] {
-        guard let vadContext else {
-            throw TranscriptionError.contextInitializationFailed
-        }
-        guard let segments = vadContext.speechSegments(in: samples) else {
-            throw TranscriptionError.processingFailed
-        }
-        return segments
-    }
     
     /// Keeps only speech, mirroring upstream whisper_full VAD stitching:
     /// each segment (already padded by the VAD) gets 0.1s of the following

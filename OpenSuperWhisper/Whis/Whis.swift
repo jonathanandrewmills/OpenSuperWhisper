@@ -64,6 +64,47 @@ public class MyWhisperVadContext {
     }
 }
 
+// MARK: - Decoding State
+
+/// A decoding state owned by the caller instead of the context. Several
+/// states can decode on one loaded model at the same time (whisper_full_parallel
+/// does the same), each with its own KV caches and prompt history. The state
+/// keeps its context alive, so the model is never freed under it.
+public final class MyWhisperState {
+    let context: MyWhisperContext
+    fileprivate let pointer: OpaquePointer
+
+    fileprivate init(context: MyWhisperContext, pointer: OpaquePointer) {
+        self.context = context
+        self.pointer = pointer
+    }
+
+    deinit {
+        whisper_free_state(pointer)
+    }
+
+    public var segmentCount: Int {
+        Int(whisper_full_n_segments_from_state(pointer))
+    }
+
+    public var languageID: Int {
+        Int(whisper_full_lang_id_from_state(pointer))
+    }
+
+    public func segmentText(_ index: Int) -> String? {
+        guard let cStr = whisper_full_get_segment_text_from_state(pointer, Int32(index)) else { return nil }
+        return String(cString: cStr)
+    }
+
+    public func segmentT0(_ index: Int) -> Int64 {
+        whisper_full_get_segment_t0_from_state(pointer, Int32(index))
+    }
+
+    public func segmentT1(_ index: Int) -> Int64 {
+        whisper_full_get_segment_t1_from_state(pointer, Int32(index))
+    }
+}
+
 // MARK: - Wrapper Class
 
 public class MyWhisperContext {
@@ -135,6 +176,11 @@ public class MyWhisperContext {
             whisper_free_state(state)
             self.state = nil
         }
+    }
+
+    public func makeState() -> MyWhisperState? {
+        guard let ctx = ctx, let state = whisper_init_state(ctx) else { return nil }
+        return MyWhisperState(context: self, pointer: state)
     }
     
     // MARK: - OpenVINO
@@ -684,26 +730,43 @@ public class MyWhisperContext {
             } else {
                 result = whisper_full(ctx, params, buffer.baseAddress, Int32(samples.count))
             }
-            
-            // Free c-allocated strings
-            if let suppressRegex = params.suppress_regex {
-                free(UnsafeMutablePointer(mutating: suppressRegex))
-            }
-            if let initialPrompt = params.initial_prompt {
-                free(UnsafeMutablePointer(mutating: initialPrompt))
-            }
-            if let language = params.language {
-                free(UnsafeMutablePointer(mutating: language))
-            }
-            
-            // Free the allocated memory for grammar_rules
-            if let baseAddress = params.grammar_rules {
-                free(UnsafeMutableRawPointer(mutating: baseAddress))
-            }
+            Self.freeAllocations(of: params)
             return result
         }
         
         return result == 0
+    }
+
+    /// Decodes on a caller-owned state, leaving this context's own state alone.
+    public func full(samples: [Float], params: inout whisper_full_params, state: MyWhisperState) -> Bool {
+        guard let ctx = ctx, state.context === self else {
+            Self.freeAllocations(of: params)
+            return false
+        }
+        let result = samples.withUnsafeBufferPointer { buffer in
+            whisper_full_with_state(ctx, state.pointer, params, buffer.baseAddress, Int32(samples.count))
+        }
+        Self.freeAllocations(of: params)
+        return result == 0
+    }
+
+    /// Frees what WhisperFullParams.toC() allocated for one call.
+    private static func freeAllocations(of params: whisper_full_params) {
+        if let suppressRegex = params.suppress_regex {
+            free(UnsafeMutablePointer(mutating: suppressRegex))
+        }
+        if let initialPrompt = params.initial_prompt {
+            free(UnsafeMutablePointer(mutating: initialPrompt))
+        }
+        if let language = params.language {
+            free(UnsafeMutablePointer(mutating: language))
+        }
+        if let promptTokens = params.prompt_tokens {
+            UnsafeMutablePointer(mutating: promptTokens).deallocate()
+        }
+        if let baseAddress = params.grammar_rules {
+            free(UnsafeMutableRawPointer(mutating: baseAddress))
+        }
     }
     
     public func fullParallel(samples: [Float], params: inout WhisperFullParams, nProcessors: Int) -> Bool {
