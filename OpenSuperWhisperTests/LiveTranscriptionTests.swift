@@ -550,6 +550,36 @@ final class LiveTranscriberTests: XCTestCase {
         XCTAssertEqual(decoder.calls.map(\.peak), [0.5])
     }
 
+    func testABufferThatFreedItsStartStillServesLaterAudio() {
+        let buffer = LiveAudioBuffer(recordingURL: URL(fileURLWithPath: "/tmp/osw-discard.wav"))
+        let samples = (0..<(30 * sampleRate)).map { Float($0 % 1000) / 1000 }
+        buffer.append(samples)
+
+        buffer.discard(before: 5 * sampleRate)
+        XCTAssertEqual(buffer.heldCount, samples.count, "Freeing a few seconds is not worth moving the buffer")
+
+        buffer.discard(before: 20 * sampleRate)
+        XCTAssertEqual(buffer.count, samples.count)
+        XCTAssertEqual(buffer.heldCount, 10 * sampleRate)
+        let later = (25 * sampleRate)..<(26 * sampleRate)
+        XCTAssertEqual(buffer.samples(in: later), Array(samples[later]))
+    }
+
+    func testALongDictationHoldsOnlyAboutTheOpenChunk() async throws {
+        let decoder = FakeLiveDecoder()
+        let (transcriber, buffer) = makeTranscriber(decoder)
+        let samples = audio(Array(repeating: [(10.0, true), (1.0, false)], count: 6).flatMap { $0 } + [(4, true)])
+        feed(samples, to: buffer)
+        await transcriber.waitUntilIdle()
+
+        XCTAssertLessThan(buffer.heldCount, 22 * sampleRate, "\(Double(buffer.heldCount) / Double(sampleRate)) s held")
+        buffer.finish()
+        let transcript = try await transcriber.finish()
+        XCTAssertEqual(transcript.chunks.count, 7)
+        XCTAssertEqual(transcript.chunks.last?.samples.upperBound, samples.count)
+        XCTAssertEqual(decoder.calls.map(\.peak), Array(repeating: 0.5, count: 7), "Every chunk was decoded from its own audio")
+    }
+
     func testThePastedTextIsTheChunkDecodesJoinedInOrder() async throws {
         let decoder = FakeLiveDecoder()
         // A forced cut splits a sentence, and the next chunk's decode opens

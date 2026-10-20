@@ -56,6 +56,8 @@ final class LiveAudioBuffer: @unchecked Sendable {
     let recordingURL: URL
     private let lock = NSLock()
     private var storage: [Float] = []
+    /// Index of storage[0] in the recording: samples before it were freed.
+    private var offset = 0
     private var end: Event?
     private var observer: ((Event) -> Void)?
 
@@ -99,11 +101,34 @@ final class LiveAudioBuffer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Samples appended so far, including any freed.
     var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return offset + storage.count
+    }
+
+    /// Samples still held in memory.
+    var heldCount: Int {
         lock.lock()
         defer { lock.unlock() }
         return storage.count
     }
+
+    /// Frees the samples before `index`, which the reader will not ask for
+    /// again. The recording itself is saved separately, so a long dictation
+    /// need not keep a second full copy here. Small amounts are left in
+    /// place, since freeing moves the rest of the buffer.
+    func discard(before index: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let freed = min(index, offset + storage.count) - offset
+        guard freed >= Self.minimumDiscard else { return }
+        storage.removeFirst(freed)
+        offset += freed
+    }
+
+    private static let minimumDiscard = 10 * 16_000
 
     var isFinished: Bool {
         lock.lock()
@@ -120,7 +145,8 @@ final class LiveAudioBuffer: @unchecked Sendable {
     func samples(in range: Range<Int>) -> [Float] {
         lock.lock()
         defer { lock.unlock() }
-        return Array(storage[range.clamped(to: 0..<storage.count)])
+        let held = range.clamped(to: offset..<(offset + storage.count))
+        return Array(storage[(held.lowerBound - offset)..<(held.upperBound - offset)])
     }
 }
 
@@ -481,6 +507,8 @@ final class LiveTranscriber: @unchecked Sendable {
                 try probeAudio(final: false)
                 try decodeCutChunks()
             } while probedSamples != probed
+            // Only the open chunk is read from here on.
+            audio.discard(before: openChunkStart)
             try previewIfDue()
         } catch {
             fail(error)
